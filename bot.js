@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
-const { makeWASocket, DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore, fetchLatestWaWebVersion } = require('stian-baileys');
+const makeWASocket = require('@whiskeysockets/baileys').default;
+const { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const { useMongoAuthState } = require('baileys-mongodb');
 const P = require('pino');
 const QRCode = require('qrcode');
@@ -7,7 +8,6 @@ const https = require('https');
 const { getLinkPreview } = require('link-preview-js');
 const express = require('express');
 
-// 1. Catch unhandled errors
 process.on('uncaughtException', (err) => console.error('🚨 Uncaught Exception:', err));
 process.on('unhandledRejection', (reason) => console.error('🚨 Unhandled Rejection:', reason));
 
@@ -16,26 +16,37 @@ const MONGO_URI = process.env.MONGO_URI;
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 const logger = P({ level: 'silent' });
 
-// 2. Express Server (starts immediately)
 const app = express();
 app.use(express.json());
 app.get('/', (req, res) => res.send('Bot is running 24/7!'));
 app.listen(process.env.PORT || 3000, () => console.log('✅ Express Server is listening.'));
 
-// 3. Telegram Webhook
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 if (RENDER_URL) {
     bot.setWebHook(`${RENDER_URL}/bot${TELEGRAM_TOKEN}`).catch(err => console.error('❌ Webhook error:', err.message));
 }
 app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
 
-// State
 const activeSessions = new Map();
 const userStates = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- Telegram Handlers ---
-bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp.\nUse `.grstatus <text>` to post."));
+bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp.\nUse `.grstatus <text>` to post.\nUse `/reset` if linking fails."));
+
+bot.onText(/\/reset/, async (msg) => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, "🧹 Clearing your old session from MongoDB... Please wait.");
+    try {
+        const { state } = await useMongoAuthState(MONGO_URI, `session-${chatId}`);
+        // Clear the keys and creds
+        state.creds = {};
+        state.keys = {};
+        await state.saveCreds();
+        bot.sendMessage(chatId, "✅ Session cleared! You can now use `/link` to try again.");
+    } catch (e) {
+        bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
+    }
+});
 
 bot.onText(/\/link/, (msg) => {
     const chatId = msg.chat.id;
@@ -79,21 +90,17 @@ bot.on('message', async (msg) => {
     }
 });
 
-// --- WhatsApp Connection Logic ---
 async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
-        
-        // CRITICAL: Fetch the latest web version dynamically
-        const { version } = await fetchLatestWaWebVersion({}); 
 
         const sock = makeWASocket({
-            version: version,
+            version: [2, 3000, 1023223821], // Stable version
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
             printQRInTerminal: false,
             logger: logger,
-            browser: Browsers.macOS('Desktop'), // Spoofs a desktop device
+            browser: Browsers.ubuntu('Chrome'), // Official browser string
             markOnlineOnConnect: false,
             syncFullHistory: false
         });
@@ -104,7 +111,7 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
 
-            if (method === 'pair' && (connection === 'connecting' || qr) && !sock.authState.creds.registered && !codeRequested) {
+            if (method === 'pair' && connection === 'connecting' && !sock.authState.creds.registered && !codeRequested) {
                 codeRequested = true;
                 try {
                     const code = await sock.requestPairingCode(phoneNumber);
@@ -130,9 +137,9 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
                 if (statusCode === DisconnectReason.loggedOut) {
                     activeSessions.delete(chatId);
                     userStates.delete(chatId);
-                    bot.sendMessage(chatId, "❌ Logged out. Use `/link` to reconnect with a fresh session.");
+                    bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link` to try again.");
                 } else if (statusCode === DisconnectReason.restartRequired) {
-                    startWhatsAppSession(chatId, method, phoneNumber); // Safe to reconnect
+                    startWhatsAppSession(chatId, method, phoneNumber);
                 }
             }
         });
@@ -142,11 +149,10 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     }
 }
 
-// --- Posting Logic (same as before, kept for completeness) ---
 async function postStatusToGroups(sock, statusMessage, chatId) {
-    // ... (Your existing postStatusToGroups function from the previous code goes here) ...
+    // ... (Your existing postStatusToGroups code from the previous step) ...
+    // Make sure to copy the function over!
 }
-
-const fetchImageBuffer = (url) => { /* ... */ };
-
-console.log("Telegram Manager Bot is running...");
+const fetchImageBuffer = (url) => {
+    // ... (Your existing fetchImageBuffer code) ...
+                                                                                              }

@@ -9,14 +9,13 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "stian-baileys": "^0.2.2",
+    "@whiskeysockets/baileys": "^6.7.5",
+    "baileys-mongodb": "^1.0.0",
+    "express": "^4.18.0",
+    "mongodb": "^6.0.0",
+    "node-telegram-bot-api": "^0.66.0",
     "pino": "^9.0.0",
     "qrcode": "^1.5.3",
-    "qrcode-terminal": "^0.12.0",
-    "link-preview-js": "^3.0.0",
-    "baileys-mongodb": "^1.0.0",
-    "mongodb": "^6.0.0",
-    "express": "^4.18.0",
-    "node-telegram-bot-api": "^0.66.0"
+    "link-preview-js": "^3.0.0"
   }
 }

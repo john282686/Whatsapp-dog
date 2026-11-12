@@ -28,18 +28,17 @@ if (RENDER_URL) {
 app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
 
 const activeSessions = new Map();
-const userStates = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp.\nUse `.grstatus <text>` to post.\nUse `/reset` if linking fails."));
 
-// 🚨 FIXED: Reset command now uses the correct removeCreds() function
+// 🚨 FIXED: Reset command uses the correct removeCreds() function
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     bot.sendMessage(chatId, "🧹 Clearing your old session from MongoDB... Please wait.");
     try {
         const { removeCreds } = await useMongoAuthState(MONGO_URI, `session-${chatId}`);
-        await removeCreds(); // This is the correct method to wipe the session
+        await removeCreds();
         bot.sendMessage(chatId, "✅ Session cleared! You can now use `/link` to try again.");
     } catch (e) {
         bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
@@ -49,36 +48,14 @@ bot.onText(/\/reset/, async (msg) => {
 bot.onText(/\/link/, (msg) => {
     const chatId = msg.chat.id;
     if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
-    userStates.set(chatId, { action: 'AWAITING_METHOD' });
-    bot.sendMessage(chatId, "Link via:\n\n1️⃣ Reply `1` for QR Code\n2️⃣ Reply `2` for Pairing Code", { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait a moment.");
+    startWhatsAppSession(chatId);
 });
 
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text ? msg.text.trim() : '';
     if (!text || text.startsWith('/')) return;
-    const state = userStates.get(chatId);
-
-    if (state && state.action === 'AWAITING_METHOD') {
-        if (text === '1') {
-            userStates.set(chatId, { action: 'CONNECTING_QR' });
-            bot.sendMessage(chatId, "⏳ Generating QR Code...");
-            startWhatsAppSession(chatId, 'qr');
-        } else if (text === '2') {
-            userStates.set(chatId, { action: 'AWAITING_PHONE' });
-            bot.sendMessage(chatId, "📱 Send your WhatsApp number with country code (e.g., `233201065918`).");
-        }
-        return;
-    }
-
-    if (state && state.action === 'AWAITING_PHONE') {
-        const cleanNumber = text.replace(/\D/g, '');
-        if (cleanNumber.length < 10) return bot.sendMessage(chatId, "❌ Invalid number.");
-        userStates.set(chatId, { action: 'CONNECTING_PAIR' });
-        bot.sendMessage(chatId, "⏳ Requesting Pairing Code...");
-        startWhatsAppSession(chatId, 'pair', cleanNumber);
-        return;
-    }
 
     if (text.startsWith('.grstatus ')) {
         const sock = activeSessions.get(chatId);
@@ -88,7 +65,8 @@ bot.on('message', async (msg) => {
     }
 });
 
-async function startWhatsAppSession(chatId, method, phoneNumber = null) {
+// --- WHATSAPP CONNECTION LOGIC (QR ONLY) ---
+async function startWhatsAppSession(chatId) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
@@ -98,46 +76,45 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
             printQRInTerminal: false,
             logger: logger,
-            browser: Browsers.ubuntu('Chrome'),
+            browser: Browsers.macOS('Desktop'), // Spoofs a desktop device to bypass 405
             markOnlineOnConnect: false,
             syncFullHistory: false
         });
 
         sock.ev.on('creds.update', saveCreds);
-        let codeRequested = false;
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
 
-            if (method === 'pair' && connection === 'connecting' && !sock.authState.creds.registered && !codeRequested) {
-                codeRequested = true;
-                try {
-                    const code = await sock.requestPairingCode(phoneNumber);
-                    bot.sendMessage(chatId, `📱 YOUR PAIRING CODE: *${code}*\n\nGo to WhatsApp > Linked Devices > Link with phone number instead.`, { parse_mode: 'Markdown' });
-                } catch (e) { bot.sendMessage(chatId, `❌ Pairing failed: ${e.message}`); userStates.delete(chatId); }
-            }
+            // Log every connection update for debugging
+            if (connection) console.log(`Connection state: ${connection}`);
 
-            if (method === 'qr' && qr) {
+            if (qr) {
                 try {
                     const qrImageBuffer = await QRCode.toBuffer(qr);
-                    await bot.sendPhoto(chatId, qrImageBuffer, { caption: '📸 Scan this QR code with WhatsApp.' });
+                    await bot.sendPhoto(chatId, qrImageBuffer, { caption: '📸 Scan this QR code with WhatsApp > Linked Devices.' });
                 } catch (e) { console.log("QR error:", e); }
             }
 
             if (connection === 'open') {
                 activeSessions.set(chatId, sock);
-                userStates.delete(chatId);
                 bot.sendMessage(chatId, "✅ WhatsApp linked! Use `.grstatus <text>`");
             }
 
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.log(`Connection closed. Status code: ${statusCode}`);
+                
                 if (statusCode === DisconnectReason.loggedOut) {
                     activeSessions.delete(chatId);
-                    userStates.delete(chatId);
                     bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link` to try again.");
                 } else if (statusCode === DisconnectReason.restartRequired) {
-                    startWhatsAppSession(chatId, method, phoneNumber);
+                    // This is a normal step after scanning a QR code
+                    console.log('Restart required. Reconnecting...');
+                    startWhatsAppSession(chatId);
+                } else {
+                    // For other errors, wait a bit before retrying to avoid spamming
+                    setTimeout(() => startWhatsAppSession(chatId), 5000);
                 }
             }
         });
@@ -147,6 +124,7 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     }
 }
 
+// --- Posting Logic ---
 async function postStatusToGroups(sock, statusMessage, chatId) {
     try {
         const groups = await sock.groupFetchAllParticipating();

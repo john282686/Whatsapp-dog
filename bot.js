@@ -7,17 +7,51 @@ const https = require('https');
 const { getLinkPreview } = require('link-preview-js');
 const express = require('express');
 
+// --- 1. CATCH ANY CRASHES ---
+process.on('uncaughtException', (err) => {
+    console.error('🚨 Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('🚨 Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const MONGO_URI = process.env.MONGO_URI;
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 const logger = P({ level: 'silent' });
 
+// --- 2. START EXPRESS SERVER IMMEDIATELY (Keeps Render Alive) ---
+const app = express();
+app.use(express.json());
+app.get('/', (req, res) => res.send('Bot is running 24/7!'));
+app.listen(process.env.PORT || 3000, () => {
+    console.log('✅ Express Server is listening and ready.');
+});
+
+// --- 3. INITIALIZE TELEGRAM BOT ---
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// --- 4. WEBHOOK SETUP ---
+if (RENDER_URL) {
+    const webhookUrl = `${RENDER_URL}/bot${TELEGRAM_TOKEN}`;
+    bot.setWebHook(webhookUrl)
+        .then(() => console.log(`✅ Webhook successfully set to: ${webhookUrl}`))
+        .catch(err => console.error('❌ Failed to set webhook:', err.message));
+} else {
+    console.log("⚠️ RENDER_EXTERNAL_URL is missing! Webhook not set.");
+}
+
+app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
+    bot.processUpdate(req.body);
+    res.sendStatus(200);
+});
+
+// --- 5. APP STATE ---
 const activeSessions = new Map();
 const userStates = new Map();
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- Telegram Commands ---
+// --- 6. TELEGRAM COMMANDS ---
 bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, "👋 Welcome! Use `/link` to connect your WhatsApp account.\nUse `.grstatus <text>` to post a status.");
 });
@@ -67,7 +101,7 @@ bot.on('message', async (msg) => {
     }
 });
 
-// --- WhatsApp Connection Logic ---
+// --- 7. WHATSAPP CONNECTION LOGIC ---
 async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     try {
         const sessionId = `session-${chatId}`;
@@ -92,19 +126,17 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
 
-            // 🚨 FIX: Pairing Code must wait for 'connecting' state
             if (method === 'pair' && connection === 'connecting' && !sock.authState.creds.registered && !codeRequested) {
                 codeRequested = true;
                 try {
                     const code = await sock.requestPairingCode(phoneNumber);
                     bot.sendMessage(chatId, `📱 YOUR PAIRING CODE: *${code}*\n\nGo to WhatsApp > Linked Devices > Link with phone number instead.`, { parse_mode: 'Markdown' });
                 } catch (e) {
-                    bot.sendMessage(chatId, `❌ Failed to get pairing code: ${e.message}. Please try the QR code method instead.`);
+                    bot.sendMessage(chatId, `❌ Failed to get pairing code: ${e.message}. Try the QR code instead.`);
                     userStates.delete(chatId);
                 }
             }
 
-            // Handle QR Code
             if (method === 'qr' && qr) {
                 try {
                     const qrImageBuffer = await QRCode.toBuffer(qr);
@@ -112,14 +144,12 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
                 } catch (e) { console.log("Error sending QR image:", e); }
             }
 
-            // Handle connection open
             if (connection === 'open') {
                 activeSessions.set(chatId, sock);
                 userStates.delete(chatId);
                 bot.sendMessage(chatId, "✅ WhatsApp linked successfully!\nYou can now use `.grstatus <text>`");
             }
 
-            // Handle connection close and reconnection
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 if (statusCode === DisconnectReason.loggedOut) {
@@ -127,8 +157,6 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
                     userStates.delete(chatId);
                     bot.sendMessage(chatId, "❌ WhatsApp logged out. Use `/link` to reconnect.");
                 } else if (statusCode === DisconnectReason.restartRequired) {
-                    // 🚨 FIX: This is the normal step after a QR scan. Reconnect to finalize.
-                    console.log(`Session for ${chatId} needs a restart. Reconnecting...`);
                     startWhatsAppSession(chatId, method, phoneNumber);
                 }
             }
@@ -139,4 +167,124 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     }
 }
 
-// --- Your posting logic (postStatusToGroups, fetchImageBuffer, Express server, etc.) remains the same ---
+// --- 8. STATUS POSTING LOGIC ---
+async function postStatusToGroups(sock, statusMessage, chatId) {
+    try {
+        const groups = await sock.groupFetchAllParticipating();
+        let validGroups = Object.values(groups).filter(g => !g.announce); 
+        validGroups = validGroups.sort(() => Math.random() - 0.5);
+        
+        const urlRegex = /(https?:\/\/[^\s]+)/g;
+        const urls = statusMessage.match(urlRegex);
+        
+        let imgBuffer = null;
+        let channelName = "Join the Channel";
+        let channelDesc = "Click the link to view";
+
+        if (urls && urls.length > 0) {
+            const targetUrl = urls[0];
+            if (targetUrl.includes('whatsapp.com/channel/')) {
+                const channelId = targetUrl.split('/channel/')[1]?.split('?')[0];
+                if (channelId) {
+                    try {
+                        const metadata = await sock.newsletterMetadata("invite", channelId);
+                        if (metadata) {
+                            channelName = metadata.name || channelName;
+                            channelDesc = metadata.description || channelDesc;
+                            if (metadata.preview) imgBuffer = await fetchImageBuffer(metadata.preview);
+                        }
+                    } catch (e) { }
+                }
+            } else if (targetUrl.includes('chat.whatsapp.com/')) {
+                const inviteCode = targetUrl.split('/').pop();
+                try {
+                    const groupInfo = await sock.groupGetInviteInfo(inviteCode);
+                    if (groupInfo) {
+                        channelName = groupInfo.subject || channelName;
+                        channelDesc = groupInfo.desc || channelDesc;
+                    }
+                } catch (e) { }
+            } else {
+                try {
+                    const preview = await getLinkPreview(targetUrl, { headers: { 'user-agent': 'Mozilla/5.0' } });
+                    if (preview.title) channelName = preview.title;
+                    if (preview.description) channelDesc = preview.description;
+                    if (preview.images && preview.images.length > 0) {
+                        imgBuffer = await fetchImageBuffer(preview.images[0]);
+                    }
+                } catch (e) { }
+            }
+        }
+
+        if (!imgBuffer) {
+            try { imgBuffer = await fetchImageBuffer('https://picsum.photos/500/500.jpg'); } catch (e) { }
+        }
+
+        let content = { text: statusMessage };
+        if (imgBuffer) {
+            const { imageMessage } = await prepareWAMessageMedia(
+                { image: imgBuffer },
+                { upload: sock.waUploadToServer, mediaTypeOverride: 'thumbnail-link' }
+            );
+            imageMessage.height = 720;
+            imageMessage.width = 480;
+
+            content = {
+                text: statusMessage,
+                linkPreview: {
+                    'matched-text': urls ? urls[0] : '',
+                    'canonical-url': urls ? urls[0] : '',
+                    title: channelName,
+                    description: channelDesc,
+                    previewType: 0, 
+                    jpegThumbnail: imgBuffer,
+                    highQualityThumbnail: imageMessage,
+                    linkPreviewMetadata: { socialMediaPostType: 4, linkMediaDuration: 0 }
+                }
+            };
+        }
+
+        let count = 1;
+        let successCount = 0;
+        let batchCount = 0;
+
+        for (const group of validGroups) {
+            try {
+                await sock.stianStatus.sendGroupStatus(group.id, content);
+                successCount++;
+                batchCount++;
+            } catch (err) { }
+            
+            count++;
+            if (count <= validGroups.length) {
+                const humanJitter = Math.floor(Math.random() * 400) + 100;
+                await sleep(1000 + humanJitter); 
+                if (batchCount === 20) {
+                    await sleep(10000);
+                    batchCount = 0; 
+                }
+            }
+        }
+        
+        bot.sendMessage(chatId, `🎉 Finished! Successfully posted to ${successCount}/${validGroups.length} groups.`);
+    } catch (error) {
+        bot.sendMessage(chatId, `❌ Error during posting: ${error.message}`);
+    }
+}
+
+const fetchImageBuffer = (url) => {
+    return new Promise((resolve, reject) => {
+        const options = { headers: { 'User-Agent': 'Mozilla/5.0' } };
+        https.get(url, options, (res) => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                return fetchImageBuffer(res.headers.location).then(resolve).catch(reject);
+            }
+            if (res.statusCode !== 200) return reject(new Error("Status " + res.statusCode));
+            const data = [];
+            res.on('data', (chunk) => data.push(chunk));
+            res.on('end', () => resolve(Buffer.concat(data)));
+        }).on('error', reject);
+    });
+};
+
+console.log("Telegram Manager Bot is running...");

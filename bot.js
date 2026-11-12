@@ -2,24 +2,25 @@ const TelegramBot = require('node-telegram-bot-api');
 const { makeWASocket, DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore } = require('stian-baileys');
 const { useMongoAuthState } = require('baileys-mongodb');
 const P = require('pino');
-const QRCode = require('qrcode'); // For generating QR images
+const QRCode = require('qrcode');
 const https = require('https');
 const { getLinkPreview } = require('link-preview-js');
 const express = require('express');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const MONGO_URI = process.env.MONGO_URI;
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 const logger = P({ level: 'silent' });
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+// 🚨 USE WEBHOOKS INSTEAD OF POLLING
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Stores active WhatsApp sockets and user states
 const activeSessions = new Map();
 const userStates = new Map(); 
 
 // --- 🟢 TELEGRAM COMMANDS ---
-
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
     bot.sendMessage(chatId, "👋 Welcome to the Multi-Bot Manager!\n\nUse `/link` to connect your WhatsApp account.\nUse `.grstatus <text>` to post a status.");
@@ -31,7 +32,6 @@ bot.onText(/\/link/, (msg) => {
         return bot.sendMessage(chatId, "⚠️ You already have a WhatsApp account linked.");
     }
     
-    // Ask the user to choose their method
     userStates.set(chatId, { action: 'AWAITING_METHOD' });
     bot.sendMessage(chatId, "How would you like to link your WhatsApp?\n\n1️⃣ Reply with `1` for QR Code\n2️⃣ Reply with `2` for Pairing Code", { parse_mode: 'Markdown' });
 });
@@ -40,11 +40,10 @@ bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text ? msg.text.trim() : '';
     
-    if (!text || text.startsWith('/')) return; // Ignore commands for this handler
+    if (!text || text.startsWith('/')) return;
 
     const state = userStates.get(chatId);
 
-    // 1. User chooses method
     if (state && state.action === 'AWAITING_METHOD') {
         if (text === '1') {
             userStates.set(chatId, { action: 'CONNECTING_QR' });
@@ -59,7 +58,6 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    // 2. User provides phone number for Pairing Code
     if (state && state.action === 'AWAITING_PHONE') {
         const cleanNumber = text.replace(/\D/g, '');
         if (cleanNumber.length < 10) {
@@ -71,7 +69,6 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    // 3. Handle .grstatus command
     if (text.startsWith('.grstatus ')) {
         const sock = activeSessions.get(chatId);
         if (!sock) {
@@ -85,7 +82,6 @@ bot.on('message', async (msg) => {
 });
 
 // --- 🟡 WHATSAPP CONNECTION LOGIC ---
-
 async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     try {
         const sessionId = `session-${chatId}`;
@@ -110,7 +106,6 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
 
-            // If user chose QR Code
             if (method === 'qr' && qr) {
                 try {
                     const qrImageBuffer = await QRCode.toBuffer(qr);
@@ -120,7 +115,6 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
                 }
             }
 
-            // If user chose Pairing Code
             if (method === 'pair' && connection === 'connecting' && !sock.authState.creds.registered && !codeRequested) {
                 codeRequested = true;
                 try {
@@ -144,19 +138,16 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
                     activeSessions.delete(chatId);
                     userStates.delete(chatId);
                     bot.sendMessage(chatId, "❌ WhatsApp logged out. Use `/link` to reconnect.");
-                } else {
-                    // Reconnect logic handled by PM2 / Render if it crashes, or manual retry here.
                 }
             }
         });
     } catch (err) {
-        console.log("Error starting session:", err);
-        bot.sendMessage(chatId, "❌ Internal error starting session.");
+        console.error("Error starting session:", err);
+        bot.sendMessage(chatId, "❌ Internal error starting session. Check Render logs.");
     }
 }
 
 // --- 🚀 STATUS POSTING LOGIC ---
-
 async function postStatusToGroups(sock, statusMessage, chatId) {
     try {
         const groups = await sock.groupFetchAllParticipating();
@@ -276,15 +267,33 @@ const fetchImageBuffer = (url) => {
     });
 };
 
-// --- 🌐 RENDER KEEP-ALIVE ---
+// --- 🌐 EXPRESS SERVER & WEBHOOK SETUP ---
 const app = express();
-app.get('/', (req, res) => res.send('Bot is running!'));
-app.listen(process.env.PORT || 3000, () => console.log('Server ready'));
+app.use(express.json()); // Required for webhooks to read the message body
 
-setInterval(() => {
-    if (process.env.RENDER_EXTERNAL_URL) {
-        https.get(process.env.RENDER_EXTERNAL_URL, (res) => console.log(`Ping: ${res.statusCode}`)).on('error', () => {});
+// Telegram will send updates to this URL
+app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
+    bot.processUpdate(req.body);
+    res.sendStatus(200);
+});
+
+app.get('/', (req, res) => res.send('Bot is running 24/7!'));
+
+app.listen(process.env.PORT || 3000, async () => {
+    console.log('Server ready');
+    
+    // 🚨 REGISTER THE WEBHOOK
+    if (RENDER_URL) {
+        const webhookUrl = `${RENDER_URL}/bot${TELEGRAM_TOKEN}`;
+        try {
+            await bot.setWebHook(webhookUrl);
+            console.log(`✅ Webhook successfully set to: ${webhookUrl}`);
+        } catch (error) {
+            console.error('❌ Failed to set webhook:', error.message);
+        }
+    } else {
+        console.log("⚠️ RENDER_EXTERNAL_URL is missing! Webhook not set.");
     }
-}, 14 * 60 * 1000);
+});
 
-console.log("Telegram Manager Bot is running...");
+console.log("Telegram Manager Bot is running on Webhooks...");

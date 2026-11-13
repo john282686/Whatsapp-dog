@@ -9,7 +9,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "stian-baileys": "^0.2.2",
+    "@whiskeysockets/baileys": "github:kobie3717/Baileys#fix/405-platform-macos",
     "baileys-mongodb": "^1.0.9",
     "express": "^4.18.0",
     "mongodb": "^6.0.0",

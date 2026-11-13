@@ -37,10 +37,8 @@ async function clearSessionFromDB(sessionId) {
         client = new MongoClient(MONGO_URI);
         await client.connect();
         const db = client.db();
-        // We try deleting from all possible collection names used by baileys-mongodb
         await db.collection('sessions').deleteOne({ _id: sessionId });
         await db.collection('baileys_auth').deleteOne({ _id: sessionId });
-        await db.collection('auth').deleteOne({ _id: sessionId });
         console.log(`✅ Session ${sessionId} forcefully wiped from MongoDB.`);
     } catch (e) {
         console.error("DB clear warning:", e.message);
@@ -49,7 +47,6 @@ async function clearSessionFromDB(sessionId) {
     }
 }
 
-// --- TELEGRAM COMMANDS ---
 bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code."));
 
 bot.onText(/\/reset/, async (msg) => {
@@ -67,11 +64,10 @@ bot.onText(/\/link/, async (msg) => {
     const sessionId = `session-${chatId}`;
     bot.sendMessage(chatId, "🧹 Preparing a fresh session...");
     
-    // Force clear the DB
     await clearSessionFromDB(sessionId);
     
-    // 🚨 WAIT 2 SECONDS to ensure MongoDB deletion is committed before connecting
-    await sleep(2000);
+    // 🚨 WAIT 3 SECONDS to ensure MongoDB deletion is committed and avoid race conditions
+    await sleep(3000);
     
     bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait.");
     startWhatsAppSession(chatId, true);
@@ -132,15 +128,21 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
                 
                 console.log(`Disconnected. Code: ${statusCode} (${errorMessage})`);
 
-                // 🚨 PERMANENT FIX: If 401 (loggedOut), forcefully clear DB and STOP.
+                // 🚨 THE FIX: Handle 401 as a restart during login, not a fatal error
                 if (statusCode === DisconnectReason.loggedOut) {
-                    activeSessions.delete(chatId);
-                    bot.sendMessage(chatId, "❌ WhatsApp logged out the session. Force clearing old data...");
-                    
-                    await clearSessionFromDB(sessionId);
-                    
-                    bot.sendMessage(chatId, "✅ Old session deleted. Please use `/link` to scan a new QR code.");
+                    if (isInitialConnection) {
+                        console.log("401 during initial connection. Treating as restart required...");
+                        // Wait a moment and try again WITHOUT wiping the DB
+                        await sleep(5000);
+                        startWhatsAppSession(chatId, true); 
+                    } else {
+                        activeSessions.delete(chatId);
+                        bot.sendMessage(chatId, "❌ WhatsApp logged out the session. Force clearing old data...");
+                        await clearSessionFromDB(sessionId);
+                        bot.sendMessage(chatId, "✅ Old session deleted. Please use `/link` to scan a new QR code.");
+                    }
                 } else if (statusCode === DisconnectReason.restartRequired) {
+                    console.log("515 Restart Required. Reconnecting...");
                     startWhatsAppSession(chatId, false); 
                 } else {
                     if (!isInitialConnection) {
@@ -150,7 +152,6 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
             }
         });
 
-        // --- WHATSAPP MESSAGE LISTENER ---
         sock.ev.on('messages.upsert', async (m) => {
             const msg = m.messages[0];
             if (!msg.message) return;

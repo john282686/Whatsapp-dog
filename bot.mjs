@@ -30,16 +30,18 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); r
 const activeSessions = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// 🚨 HELPER: Force delete session from MongoDB
+// 🚨 HELPER: Force delete session directly from MongoDB
 async function clearSessionFromDB(sessionId) {
     let client;
     try {
         client = new MongoClient(MONGO_URI);
         await client.connect();
         const db = client.db();
+        // We try deleting from all possible collection names used by baileys-mongodb
         await db.collection('sessions').deleteOne({ _id: sessionId });
         await db.collection('baileys_auth').deleteOne({ _id: sessionId });
-        console.log(`✅ Session ${sessionId} wiped from DB.`);
+        await db.collection('auth').deleteOne({ _id: sessionId });
+        console.log(`✅ Session ${sessionId} forcefully wiped from MongoDB.`);
     } catch (e) {
         console.error("DB clear warning:", e.message);
     } finally {
@@ -53,7 +55,7 @@ bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     const sessionId = `session-${chatId}`;
-    bot.sendMessage(chatId, "🧹 Clearing session...");
+    bot.sendMessage(chatId, "🧹 Force clearing session from database...");
     await clearSessionFromDB(sessionId);
     bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
 });
@@ -65,10 +67,14 @@ bot.onText(/\/link/, async (msg) => {
     const sessionId = `session-${chatId}`;
     bot.sendMessage(chatId, "🧹 Preparing a fresh session...");
     
+    // Force clear the DB
     await clearSessionFromDB(sessionId);
     
+    // 🚨 WAIT 2 SECONDS to ensure MongoDB deletion is committed before connecting
+    await sleep(2000);
+    
     bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait.");
-    startWhatsAppSession(chatId, true); // true = isInitialConnection
+    startWhatsAppSession(chatId, true);
 });
 
 // --- CONNECTION LOGIC ---
@@ -122,23 +128,18 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
             if (connection === 'close') {
                 clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const errorMessage = lastDisconnect?.error?.message || "Unknown error";
+                const errorMessage = lastDisconnect?.error?.message || "Unknown Error";
                 
                 console.log(`Disconnected. Code: ${statusCode} (${errorMessage})`);
 
-                // 🚨 PERMANENT FIX: If 401 (loggedOut), DO NOT RECONNECT.
+                // 🚨 PERMANENT FIX: If 401 (loggedOut), forcefully clear DB and STOP.
                 if (statusCode === DisconnectReason.loggedOut) {
                     activeSessions.delete(chatId);
-                    bot.sendMessage(chatId, "❌ WhatsApp logged out the session. Clearing old data...");
+                    bot.sendMessage(chatId, "❌ WhatsApp logged out the session. Force clearing old data...");
                     
-                    try {
-                        const { removeCreds } = await useMongoAuthState(MONGO_URI, sessionId);
-                        await removeCreds(); 
-                    } catch (e) {
-                        await clearSessionFromDB(sessionId);
-                    }
+                    await clearSessionFromDB(sessionId);
                     
-                    bot.sendMessage(chatId, "✅ Old session deleted. Use `/link` to scan a new QR code.");
+                    bot.sendMessage(chatId, "✅ Old session deleted. Please use `/link` to scan a new QR code.");
                 } else if (statusCode === DisconnectReason.restartRequired) {
                     startWhatsAppSession(chatId, false); 
                 } else {
@@ -149,6 +150,7 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
             }
         });
 
+        // --- WHATSAPP MESSAGE LISTENER ---
         sock.ev.on('messages.upsert', async (m) => {
             const msg = m.messages[0];
             if (!msg.message) return;

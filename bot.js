@@ -1,7 +1,8 @@
 const TelegramBot = require('node-telegram-bot-api');
-const makeWASocket = require('@ms-nicky/baileys').default;
-const { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore } = require('@ms-nicky/baileys');
+const makeWASocket = require('@whiskeysockets/baileys').default;
+const { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const { useMongoAuthState } = require('baileys-mongodb');
+const { MongoClient } = require('mongodb');
 const P = require('pino');
 const QRCode = require('qrcode');
 const https = require('https');
@@ -36,12 +37,18 @@ bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     bot.sendMessage(chatId, "🧹 Clearing session...");
+    let client;
     try {
-        const { removeCreds } = await useMongoAuthState(MONGO_URI, `session-${chatId}`);
-        await removeCreds();
+        client = new MongoClient(MONGO_URI);
+        await client.connect();
+        const db = client.db();
+        await db.collection('sessions').deleteOne({ _id: `session-${chatId}` });
+        await db.collection('baileys_auth').deleteOne({ _id: `session-${chatId}` });
         bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
     } catch (e) {
         bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
+    } finally {
+        if (client) await client.close();
     }
 });
 
@@ -66,6 +73,8 @@ bot.on('message', async (msg) => {
         } else if (text === '2') {
             userStates.set(chatId, { action: 'AWAITING_PHONE' });
             bot.sendMessage(chatId, "📱 Send your WhatsApp number with country code (e.g., `233201065918`).");
+        } else {
+            bot.sendMessage(chatId, "❌ Reply with `1` or `2`.");
         }
         return;
     }
@@ -131,7 +140,6 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
 
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                // 🚨 FIX: Handle restartRequired (515) by reconnecting immediately
                 if (statusCode === DisconnectReason.restartRequired) {
                     startWhatsAppSession(chatId, method, phoneNumber);
                 } else if (statusCode === DisconnectReason.loggedOut) {
@@ -149,4 +157,121 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     }
 }
 
-// --- Posting Logic and fetchImageBuffer (same as before) ---
+async function postStatusToGroups(sock, statusMessage, chatId) {
+    try {
+        const groups = await sock.groupFetchAllParticipating();
+        let validGroups = Object.values(groups).filter(g => !g.announce);
+        validGroups = validGroups.sort(() => Math.random() - 0.5);
+        
+        const urlRegex = /(https?:\/\/[^\s]+)/g;
+        const urls = statusMessage.match(urlRegex);
+        
+        let imgBuffer = null;
+        let channelName = "Join the Channel";
+        let channelDesc = "Click the link to view";
+
+        if (urls && urls.length > 0) {
+            const targetUrl = urls[0];
+            if (targetUrl.includes('whatsapp.com/channel/')) {
+                const channelId = targetUrl.split('/channel/')[1]?.split('?')[0];
+                if (channelId) {
+                    try {
+                        const metadata = await sock.newsletterMetadata("invite", channelId);
+                        if (metadata) {
+                            channelName = metadata.name || channelName;
+                            channelDesc = metadata.description || channelDesc;
+                            if (metadata.preview) imgBuffer = await fetchImageBuffer(metadata.preview);
+                        }
+                    } catch (e) { }
+                }
+            } else if (targetUrl.includes('chat.whatsapp.com/')) {
+                const inviteCode = targetUrl.split('/').pop();
+                try {
+                    const groupInfo = await sock.groupGetInviteInfo(inviteCode);
+                    if (groupInfo) {
+                        channelName = groupInfo.subject || channelName;
+                        channelDesc = groupInfo.desc || channelDesc;
+                    }
+                } catch (e) { }
+            } else {
+                try {
+                    const preview = await getLinkPreview(targetUrl, { headers: { 'user-agent': 'Mozilla/5.0' } });
+                    if (preview.title) channelName = preview.title;
+                    if (preview.description) channelDesc = preview.description;
+                    if (preview.images && preview.images.length > 0) {
+                        imgBuffer = await fetchImageBuffer(preview.images[0]);
+                    }
+                } catch (e) { }
+            }
+        }
+
+        if (!imgBuffer) {
+            try { imgBuffer = await fetchImageBuffer('https://picsum.photos/500/500.jpg'); } catch (e) { }
+        }
+
+        let content = { text: statusMessage };
+        if (imgBuffer) {
+            const { imageMessage } = await prepareWAMessageMedia(
+                { image: imgBuffer },
+                { upload: sock.waUploadToServer, mediaTypeOverride: 'thumbnail-link' }
+            );
+            imageMessage.height = 720;
+            imageMessage.width = 480;
+
+            content = {
+                text: statusMessage,
+                linkPreview: {
+                    'matched-text': urls ? urls[0] : '',
+                    'canonical-url': urls ? urls[0] : '',
+                    title: channelName,
+                    description: channelDesc,
+                    previewType: 0,
+                    jpegThumbnail: imgBuffer,
+                    highQualityThumbnail: imageMessage,
+                    linkPreviewMetadata: { socialMediaPostType: 4, linkMediaDuration: 0 }
+                }
+            };
+        }
+
+        let count = 1;
+        let successCount = 0;
+        let batchCount = 0;
+
+        for (const group of validGroups) {
+            try {
+                await sock.stianStatus.sendGroupStatus(group.id, content);
+                successCount++;
+                batchCount++;
+            } catch (err) { }
+            
+            count++;
+            if (count <= validGroups.length) {
+                const humanJitter = Math.floor(Math.random() * 400) + 100;
+                await sleep(1000 + humanJitter);
+                if (batchCount === 20) {
+                    await sleep(10000);
+                    batchCount = 0;
+                }
+            }
+        }
+        
+        bot.sendMessage(chatId, `🎉 Finished! Successfully posted to ${successCount}/${validGroups.length} groups.`);
+    } catch (error) {
+        bot.sendMessage(chatId, `❌ Error during posting: ${error.message}`);
+    }
+}
+
+const fetchImageBuffer = (url) => {
+    return new Promise((resolve, reject) => {
+        const options = { headers: { 'User-Agent': 'Mozilla/5.0' } };
+        https.get(url, options, (res) => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                return fetchImageBuffer(res.headers.location).then(resolve).catch(reject);
+            }
+            if (res.statusCode !== 200) return reject(new Error("Status " + res.statusCode));
+            const data = [];
+            res.on('data', (chunk) => data.push(chunk));
+            res.on('end', () => resolve(Buffer.concat(data)));
+        }).on('error', reject);
+    });
+};

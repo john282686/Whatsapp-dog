@@ -30,13 +30,8 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); r
 const activeSessions = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- TELEGRAM COMMANDS ---
-bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code.\nOnce linked, type `.grstatus <text>` inside your WhatsApp 'Message Yourself' chat."));
-
-bot.onText(/\/reset/, async (msg) => {
-    const chatId = msg.chat.id;
-    const sessionId = `session-${chatId}`;
-    bot.sendMessage(chatId, "🧹 Clearing session...");
+// 🚨 HELPER: Force delete session directly from MongoDB
+async function clearSessionFromDB(sessionId) {
     let client;
     try {
         client = new MongoClient(MONGO_URI);
@@ -44,12 +39,23 @@ bot.onText(/\/reset/, async (msg) => {
         const db = client.db();
         await db.collection('sessions').deleteOne({ _id: sessionId });
         await db.collection('baileys_auth').deleteOne({ _id: sessionId });
-        bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
+        console.log(`✅ Session ${sessionId} wiped from DB.`);
     } catch (e) {
-        bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
+        console.error("DB clear warning:", e.message);
     } finally {
         if (client) await client.close();
     }
+}
+
+// --- TELEGRAM COMMANDS ---
+bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code."));
+
+bot.onText(/\/reset/, async (msg) => {
+    const chatId = msg.chat.id;
+    const sessionId = `session-${chatId}`;
+    bot.sendMessage(chatId, "🧹 Clearing session...");
+    await clearSessionFromDB(sessionId);
+    bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
 });
 
 bot.onText(/\/link/, async (msg) => {
@@ -57,16 +63,11 @@ bot.onText(/\/link/, async (msg) => {
     if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
     
     const sessionId = `session-${chatId}`;
-    let client;
-    try {
-        client = new MongoClient(MONGO_URI);
-        await client.connect();
-        const db = client.db();
-        await db.collection('sessions').deleteOne({ _id: sessionId });
-        await db.collection('baileys_auth').deleteOne({ _id: sessionId });
-    } catch (e) { console.log("Pre-link clear warning:", e.message); }
-    finally { if (client) await client.close(); }
-
+    bot.sendMessage(chatId, "🧹 Preparing a fresh session...");
+    
+    // 🚨 CRITICAL: Wipe the DB *before* generating the socket
+    await clearSessionFromDB(sessionId);
+    
     bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait.");
     startWhatsAppSession(chatId);
 });
@@ -87,8 +88,7 @@ async function startWhatsAppSession(chatId) {
             browser: Browsers.macOS('Desktop'),
             markOnlineOnConnect: false,
             syncFullHistory: false,
-            keepAliveIntervalMs: 60000, // 🚨 Keeps connection alive
-            connectTimeoutMs: 60000
+            keepAliveIntervalMs: 60000
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -116,40 +116,39 @@ async function startWhatsAppSession(chatId) {
                 clearTimeout(qrTimeout);
                 activeSessions.set(chatId, sock);
                 bot.sendMessage(chatId, "✅ WhatsApp linked! You can now type `.grstatus <text>` inside WhatsApp.");
-                
-                // 🚨 START BACKGROUND HUMAN SIMULATION
                 simulateHumanPresence(sock);
             }
 
             if (connection === 'close') {
                 clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const errorMessage = lastDisconnect?.error?.message || "Unknown error";
+                
+                // 🚨 Send the exact error to Telegram so we can see it
+                bot.sendMessage(chatId, `❌ Disconnected. Code: ${statusCode} (${errorMessage})`);
+
                 if (statusCode === DisconnectReason.restartRequired) {
                     startWhatsAppSession(chatId);
                 } else if (statusCode === DisconnectReason.loggedOut) {
+                    // 🚨 If it logs out, DO NOT reconnect automatically. Wait for user to /link again.
                     activeSessions.delete(chatId);
-                    bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link` to try again.");
+                    bot.sendMessage(chatId, "❌ WhatsApp logged out the session. Use `/reset` then `/link` to try again.");
                 } else {
                     setTimeout(() => startWhatsAppSession(chatId), 5000);
                 }
             }
         });
 
-        // 🚨 FIXED WHATSAPP MESSAGE LISTENER
+        // --- WHATSAPP MESSAGE LISTENER ---
         sock.ev.on('messages.upsert', async (m) => {
             const msg = m.messages[0];
             if (!msg.message) return;
 
-            // Extract text safely
             const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
             if (!text) return;
 
-            console.log(`📩 Received message: ${text}`);
-
             if (text.startsWith('.grstatus ')) {
                 const statusMessage = text.replace('.grstatus ', '').trim();
-                
-                // Send reply to the exact chat the command came from
                 await sock.sendMessage(msg.key.remoteJid, { text: "⏳ Preparing status..." });
                 postStatusToGroups(sock, statusMessage, msg.key.remoteJid);
             }
@@ -161,32 +160,23 @@ async function startWhatsAppSession(chatId) {
     }
 }
 
-// --- 🚨 BACKGROUND HUMAN SIMULATION ---
+// --- BACKGROUND HUMAN SIMULATION ---
 async function simulateHumanPresence(sock) {
     while (true) {
-        // Wait between 30 and 90 minutes
         const waitMins = Math.floor(Math.random() * (90 - 30 + 1)) + 30;
         await sleep(waitMins * 60 * 1000);
         
         try {
             const myJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
-            
-            // Go online
             await sock.sendPresenceUpdate('available');
             await sleep(Math.floor(Math.random() * 3000) + 2000);
-            
-            // Show typing indicator to yourself
             await sock.sendPresenceUpdate('composing', myJid);
             await sleep(Math.floor(Math.random() * 4000) + 3000);
             await sock.sendPresenceUpdate('paused', myJid);
-            
-            // Go offline
             await sleep(5000);
             await sock.sendPresenceUpdate('unavailable');
             console.log('🤖 Simulated human presence cycle.');
-        } catch (error) {
-            // Ignore background errors
-        }
+        } catch (error) { }
     }
 }
 
@@ -282,11 +272,8 @@ async function postStatusToGroups(sock, statusMessage, targetJid) {
             
             count++;
             if (count <= validGroups.length) {
-                // 🚨 HUMAN JITTER: Random delay between 1.1s and 1.8s
                 const humanJitter = Math.floor(Math.random() * 700) + 100;
                 await sleep(1000 + humanJitter);
-                
-                // 🚨 MICRO-BREAK: Pause for 15 seconds after every 20 groups
                 if (batchCount === 20) {
                     await sleep(15000);
                     batchCount = 0;

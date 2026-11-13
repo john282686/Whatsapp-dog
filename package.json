@@ -1,15 +1,15 @@
 {
   "name": "whatsapp-bot",
   "version": "1.0.0",
-  "main": "bot.js",
+  "main": "bot.mjs",
   "scripts": {
-  "start": "node bot.mjs"
-},
+    "start": "node bot.mjs"
+  },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "github:kobie3717/Baileys#fix/405-platform-macos",
+    "stian-baileys": "^0.2.2",
     "baileys-mongodb": "^1.0.9",
     "express": "^4.18.0",
     "mongodb": "^6.0.0",

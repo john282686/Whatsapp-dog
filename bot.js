@@ -1,6 +1,5 @@
 const TelegramBot = require('node-telegram-bot-api');
-const makeWASocket = require('@whiskeysockets/baileys').default;
-const { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { makeWASocket, DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore } = require('stian-baileys');
 const { useMongoAuthState } = require('baileys-mongodb');
 const P = require('pino');
 const QRCode = require('qrcode');
@@ -30,10 +29,8 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); r
 const activeSessions = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- TELEGRAM COMMANDS ---
-bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code.\nUse `.grstatus <text>` to post."));
+bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code."));
 
-// 🚨 ROBUST RESET: Uses the official removeCreds() function from baileys-mongodb
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     const sessionId = `session-${chatId}`;
@@ -51,18 +48,16 @@ bot.onText(/\/link/, async (msg) => {
     const chatId = msg.chat.id;
     if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
     
-    // 🚨 Force a wipe before linking to ensure no stale session blocks the QR
     const sessionId = `session-${chatId}`;
     try {
         const { removeCreds } = await useMongoAuthState(MONGO_URI, sessionId);
         await removeCreds();
     } catch (e) { console.log("Pre-link clear warning:", e.message); }
 
-    bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait a moment.");
+    bot.sendMessage(chatId, "⏳ Connecting to WhatsApp... (I will tell you the status)");
     startWhatsAppSession(chatId);
 });
 
-// --- WHATSAPP COMMAND LISTENER ---
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text ? msg.text.trim() : '';
@@ -76,18 +71,17 @@ bot.on('message', async (msg) => {
     }
 });
 
-// --- WHATSAPP CONNECTION LOGIC (QR ONLY) ---
 async function startWhatsAppSession(chatId) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
 
         const sock = makeWASocket({
-            version: [2, 3000, 1023223821], // Stable version, avoids fetchLatestWaWebVersion issues
+            version: [2, 3000, 1023223821],
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-            printQRInTerminal: false, // Deprecated, we handle 'qr' event manually
+            printQRInTerminal: false,
             logger: logger,
-            browser: Browsers.ubuntu('Chrome'), // 🚨 CHANGED: Ubuntu/Chrome works reliably on Render
+            browser: Browsers.ubuntu('Chrome'), // Using Ubuntu/Chrome
             markOnlineOnConnect: false,
             syncFullHistory: false
         });
@@ -98,8 +92,10 @@ async function startWhatsAppSession(chatId) {
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
             
-            // 🚨 DEBUG LOG: See exactly what state the connection is in
-            if (connection) console.log(`Connection state: ${connection}`);
+            // 🚨 SEND EXACT STATUS TO TELEGRAM
+            if (connection) {
+                bot.sendMessage(chatId, `⚙️ Status: ${connection}`);
+            }
 
             if (qr) {
                 clearTimeout(qrTimeout);
@@ -111,28 +107,30 @@ async function startWhatsAppSession(chatId) {
 
             if (connection === 'connecting') {
                 qrTimeout = setTimeout(() => {
-                    bot.sendMessage(chatId, "❌ QR code generation timed out. Please use `/reset` and try again.");
+                    bot.sendMessage(chatId, "❌ Timeout: WhatsApp took too long to respond.");
                     sock.end(new Error('QR timeout'));
-                }, 60000); // 60-second timeout
+                }, 60000);
             }
 
             if (connection === 'open') {
                 clearTimeout(qrTimeout);
                 activeSessions.set(chatId, sock);
-                bot.sendMessage(chatId, "✅ WhatsApp linked! Use `.grstatus <text>`");
+                bot.sendMessage(chatId, "✅ WhatsApp linked! You can now use `.grstatus` inside WhatsApp.");
             }
 
             if (connection === 'close') {
                 clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                console.log(`Connection closed. Status: ${statusCode}`);
+                const errorMessage = lastDisconnect?.error?.message || "Unknown error";
                 
+                // 🚨 SEND CLOSE CODE TO TELEGRAM
+                bot.sendMessage(chatId, `❌ Disconnected. Code: ${statusCode} (${errorMessage})`);
+
                 if (statusCode === DisconnectReason.restartRequired) {
-                    console.log('Restart required. Reconnecting...');
                     startWhatsAppSession(chatId);
                 } else if (statusCode === DisconnectReason.loggedOut) {
                     activeSessions.delete(chatId);
-                    bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link` to try again.");
+                    bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link`.");
                 } else {
                     setTimeout(() => startWhatsAppSession(chatId), 5000);
                 }
@@ -140,11 +138,10 @@ async function startWhatsAppSession(chatId) {
         });
     } catch (err) {
         console.error("Session error:", err);
-        bot.sendMessage(chatId, "❌ Internal error. Check Render logs.");
+        bot.sendMessage(chatId, `❌ Error starting session: ${err.message}`);
     }
 }
 
-// --- STATUS POSTING LOGIC ---
 async function postStatusToGroups(sock, statusMessage, chatId) {
     try {
         const groups = await sock.groupFetchAllParticipating();
@@ -249,7 +246,6 @@ async function postStatusToGroups(sock, statusMessage, chatId) {
     }
 }
 
-// --- IMAGE FETCH HELPER ---
 const fetchImageBuffer = (url) => {
     return new Promise((resolve, reject) => {
         const options = { headers: { 'User-Agent': 'Mozilla/5.0' } };

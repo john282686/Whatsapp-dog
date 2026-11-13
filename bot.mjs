@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import makeWASocket, { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore, fetchLatestWaWebVersion, jidNormalizedUser } from '@whiskeysockets/baileys';
 import { useMongoAuthState } from 'baileys-mongodb';
 import { MongoClient } from 'mongodb';
 import P from 'pino';
@@ -39,7 +39,7 @@ async function clearSessionFromDB(sessionId) {
         const db = client.db();
         await db.collection('sessions').deleteOne({ _id: sessionId });
         await db.collection('baileys_auth').deleteOne({ _id: sessionId });
-        console.log(`✅ Session ${sessionId} forcefully wiped from MongoDB.`);
+        console.log(`✅ Session ${sessionId} forcefully wiped.`);
     } catch (e) {
         console.error("DB clear warning:", e.message);
     } finally {
@@ -47,12 +47,40 @@ async function clearSessionFromDB(sessionId) {
     }
 }
 
+// 🚨 AUTO-RESTORE: Reconnects to WhatsApp when Render wakes up
+async function restoreSessions() {
+    console.log("🔄 Checking for existing sessions to restore...");
+    let client;
+    try {
+        client = new MongoClient(MONGO_URI);
+        await client.connect();
+        const db = client.db();
+        // Find all session documents in the baileys_auth collection
+        const sessions = await db.collection('baileys_auth').distinct('_id');
+        
+        for (const sessionId of sessions) {
+            if (sessionId.startsWith('session-')) {
+                const chatId = parseInt(sessionId.replace('session-', ''));
+                if (!isNaN(chatId)) {
+                    console.log(`🔄 Auto-restoring session for chatId: ${chatId}`);
+                    startWhatsAppSession(chatId, false); // false = not initial connection
+                }
+            }
+        }
+    } catch (e) {
+        console.error("Restore error:", e.message);
+    } finally {
+        if (client) await client.close();
+    }
+}
+
+// --- TELEGRAM COMMANDS ---
 bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code."));
 
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     const sessionId = `session-${chatId}`;
-    bot.sendMessage(chatId, "🧹 Force clearing session from database...");
+    bot.sendMessage(chatId, "🧹 Clearing session...");
     await clearSessionFromDB(sessionId);
     bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
 });
@@ -65,9 +93,7 @@ bot.onText(/\/link/, async (msg) => {
     bot.sendMessage(chatId, "🧹 Preparing a fresh session...");
     
     await clearSessionFromDB(sessionId);
-    
-    // 🚨 WAIT 3 SECONDS to ensure MongoDB deletion is committed and avoid race conditions
-    await sleep(3000);
+    await sleep(2000);
     
     bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait.");
     startWhatsAppSession(chatId, true);
@@ -88,7 +114,7 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
             logger: logger,
             browser: Browsers.macOS('Desktop'),
             markOnlineOnConnect: false,
-            syncFullHistory: false,
+            syncFullHistory: false, // Keeps memory low on Render
             keepAliveIntervalMs: 60000
         });
 
@@ -128,65 +154,63 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
                 
                 console.log(`Disconnected. Code: ${statusCode} (${errorMessage})`);
 
-                // 🚨 THE FIX: Handle 401 as a restart during login, not a fatal error
                 if (statusCode === DisconnectReason.loggedOut) {
                     if (isInitialConnection) {
-                        console.log("401 during initial connection. Treating as restart required...");
-                        // Wait a moment and try again WITHOUT wiping the DB
+                        console.log("401 during initial connection. Re-trying...");
                         await sleep(5000);
                         startWhatsAppSession(chatId, true); 
                     } else {
                         activeSessions.delete(chatId);
-                        bot.sendMessage(chatId, "❌ WhatsApp logged out the session. Force clearing old data...");
+                        bot.sendMessage(chatId, "❌ WhatsApp logged out. Clearing data...");
                         await clearSessionFromDB(sessionId);
-                        bot.sendMessage(chatId, "✅ Old session deleted. Please use `/link` to scan a new QR code.");
+                        bot.sendMessage(chatId, "✅ Old session deleted. Use `/link` to scan a new QR code.");
                     }
                 } else if (statusCode === DisconnectReason.restartRequired) {
                     console.log("515 Restart Required. Reconnecting...");
                     startWhatsAppSession(chatId, false); 
                 } else {
                     if (!isInitialConnection) {
-                        bot.sendMessage(chatId, "❌ Connection lost. Use `/link` to reconnect.");
+                        bot.sendMessage(chatId, "❌ Connection lost. Reconnecting in 5s...");
+                        await sleep(5000);
+                        startWhatsAppSession(chatId, false);
                     }
                 }
             }
         });
 
         // --- WHATSAPP MESSAGE LISTENER ---
-sock.ev.on('messages.upsert', async (m) => {
-    if (m.type !== 'notify') return; // Only process real-time messages
+        sock.ev.on('messages.upsert', async (m) => {
+            if (m.type !== 'notify') return;
+            for (const msg of m.messages) {
+                if (!msg.message) continue;
+                
+                // Unwrap messages
+                let messageContent = msg.message;
+                if (messageContent.ephemeralMessage) messageContent = messageContent.ephemeralMessage.message;
+                if (messageContent.viewOnceMessage) messageContent = messageContent.viewOnceMessage.message;
+                if (messageContent.viewOnceMessageV2) messageContent = messageContent.viewOnceMessageV2.message;
+                
+                if (!messageContent) continue;
 
-    for (const msg of m.messages) {
-        if (!msg.message) continue;
-        
-        // Unwrap ephemeral messages (disappearing messages) if present
-        const messageContent = msg.message.ephemeralMessage ? msg.message.ephemeralMessage.message : msg.message;
-        if (!messageContent) continue;
+                const text = messageContent.conversation || messageContent.extendedTextMessage?.text;
+                if (!text) continue;
 
-        // Extract text robustly
-        const text = messageContent.conversation || messageContent.extendedTextMessage?.text;
-        if (!text) continue;
+                // Debug: Send a notification to Telegram to prove the bot received the message
+                if (text.startsWith('.grstatus')) {
+                    bot.sendMessage(chatId, `🚨 WhatsApp Listener caught: "${text}"`).catch(() => {});
+                }
 
-        // Log to Render so you can see it working
-        console.log(`📩 Message received: "${text}" | FromMe: ${msg.key.fromMe}`);
-
-        // Check if it's your command
-        if (text.startsWith('.grstatus ') && msg.key.fromMe) {
-            const statusMessage = text.replace('.grstatus ', '').trim();
-            console.log("🚀 Command detected! Starting status post...");
-            
-            // Reply to the exact chat it came from
-            await sock.sendMessage(msg.key.remoteJid, { text: "⏳ Preparing status..." });
-            
-            // Trigger the posting function
-            postStatusToGroups(sock, statusMessage, msg.key.remoteJid);
-        }
-    }
-});
+                if (text.startsWith('.grstatus ')) {
+                    const statusMessage = text.replace('.grstatus ', '').trim();
+                    await sock.sendMessage(msg.key.remoteJid, { text: "⏳ Preparing status..." });
+                    postStatusToGroups(sock, statusMessage, msg.key.remoteJid);
+                }
+            }
+        });
 
     } catch (err) {
         console.error("Session error:", err);
-        bot.sendMessage(chatId, "❌ Internal error. Check Render logs.");
+        if (isInitialConnection) bot.sendMessage(chatId, "❌ Internal error. Check Render logs.");
     }
 }
 
@@ -195,7 +219,6 @@ async function simulateHumanPresence(sock) {
     while (true) {
         const waitMins = Math.floor(Math.random() * (90 - 30 + 1)) + 30;
         await sleep(waitMins * 60 * 1000);
-        
         try {
             const myJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
             await sock.sendPresenceUpdate('available');
@@ -205,7 +228,6 @@ async function simulateHumanPresence(sock) {
             await sock.sendPresenceUpdate('paused', myJid);
             await sleep(5000);
             await sock.sendPresenceUpdate('unavailable');
-            console.log('🤖 Simulated human presence cycle.');
         } catch (error) { }
     }
 }
@@ -332,3 +354,6 @@ const fetchImageBuffer = (url) => {
         }).on('error', reject);
     });
 };
+
+// 🚨 START AUTO-RESTORE ON BOOT
+restoreSessions();

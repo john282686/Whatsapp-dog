@@ -2,6 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const { useMongoAuthState } = require('baileys-mongodb');
+const { MongoClient } = require('mongodb');
 const P = require('pino');
 const QRCode = require('qrcode');
 const https = require('https');
@@ -28,7 +29,6 @@ if (RENDER_URL) {
 app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
 
 const activeSessions = new Map();
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp.\nUse `.grstatus <text>` to post."));
 
@@ -37,19 +37,32 @@ bot.onText(/\/link/, async (msg) => {
     if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
 
     const sessionId = `session-${chatId}`;
-    bot.sendMessage(chatId, "🧹 Clearing old session...");
+    bot.sendMessage(chatId, "🧹 Clearing old session from database...");
     
+    // 🚨 FORCE CLEAR THE SESSION USING NATIVE MONGODB DRIVER
+    let client;
     try {
-        // 🚨 FORCE CLEAR THE SESSION IN MONGODB BEFORE LINKING
-        const { removeCreds } = await useMongoAuthState(MONGO_URI, sessionId);
-        await removeCreds();
-        console.log(`Session for ${chatId} cleared.`);
-
-        bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait a moment.");
-        startWhatsAppSession(chatId, 'qr');
+        client = new MongoClient(MONGO_URI);
+        await client.connect();
+        const db = client.db(); // Uses the database name in the connection string
+        // Baileys-mongodb usually stores sessions in a collection called 'sessions' or similar
+        // We will try to delete the specific document for this user
+        const collection = db.collection('sessions');
+        await collection.deleteOne({ _id: sessionId }); 
+        // Also try deleting from 'baileys_auth' if that exists
+        try {
+            await db.collection('baileys_auth').deleteOne({ _id: sessionId });
+        } catch (e) {} 
+        console.log(`Session ${sessionId} cleared from database.`);
+        bot.sendMessage(chatId, "✅ Session cleared! Generating fresh QR Code...");
     } catch (e) {
-        bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
+        console.error("DB clear error:", e);
+        bot.sendMessage(chatId, `⚠️ Could not clear DB, but trying to generate QR anyway...`);
+    } finally {
+        if (client) await client.close();
     }
+
+    startWhatsAppSession(chatId);
 });
 
 bot.on('message', async (msg) => {
@@ -66,7 +79,7 @@ bot.on('message', async (msg) => {
 });
 
 // --- WHATSAPP CONNECTION LOGIC (QR ONLY) ---
-async function startWhatsAppSession(chatId, method, phoneNumber = null) {
+async function startWhatsAppSession(chatId) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
@@ -82,18 +95,9 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
         });
 
         sock.ev.on('creds.update', saveCreds);
-        let codeRequested = false;
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
-
-            if (method === 'pair' && connection === 'connecting' && !sock.authState.creds.registered && !codeRequested) {
-                codeRequested = true;
-                try {
-                    const code = await sock.requestPairingCode(phoneNumber);
-                    bot.sendMessage(chatId, `📱 YOUR PAIRING CODE: *${code}*\n\nGo to WhatsApp > Linked Devices > Link with phone number instead.`, { parse_mode: 'Markdown' });
-                } catch (e) { bot.sendMessage(chatId, `❌ Pairing failed: ${e.message}`); }
-            }
 
             if (qr) {
                 try {
@@ -113,7 +117,7 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
                     activeSessions.delete(chatId);
                     bot.sendMessage(chatId, "❌ Logged out. Use `/link` to reconnect.");
                 } else if (statusCode === DisconnectReason.restartRequired) {
-                    startWhatsAppSession(chatId, method, phoneNumber);
+                    startWhatsAppSession(chatId);
                 }
             }
         });
@@ -123,7 +127,7 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     }
 }
 
-// --- Posting Logic ---
+// --- Posting Logic (Same as before) ---
 async function postStatusToGroups(sock, statusMessage, chatId) {
     try {
         const groups = await sock.groupFetchAllParticipating();
@@ -242,3 +246,5 @@ const fetchImageBuffer = (url) => {
         }).on('error', reject);
     });
 };
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

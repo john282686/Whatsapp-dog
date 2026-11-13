@@ -21,10 +21,7 @@ app.use(express.json());
 app.get('/', (req, res) => res.send('Bot is running 24/7!'));
 app.listen(process.env.PORT || 3000, () => console.log('✅ Express Server is listening.'));
 
-// Initialize Telegram Bot
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
-
-// Set Webhook so Telegram knows where to send messages
 if (RENDER_URL) {
     bot.setWebHook(`${RENDER_URL}/bot${TELEGRAM_TOKEN}`).catch(err => console.error('❌ Webhook error:', err.message));
 }
@@ -34,7 +31,7 @@ const activeSessions = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // --- TELEGRAM COMMANDS ---
-bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code.\nUse `.grstatus <text>` to post."));
+bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code.\nOnce linked, type `.grstatus <text>` inside your WhatsApp 'Message Yourself' chat."));
 
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
@@ -59,7 +56,6 @@ bot.onText(/\/link/, async (msg) => {
     const chatId = msg.chat.id;
     if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
     
-    // Wipe session before linking
     const sessionId = `session-${chatId}`;
     let client;
     try {
@@ -75,27 +71,12 @@ bot.onText(/\/link/, async (msg) => {
     startWhatsAppSession(chatId);
 });
 
-// --- WHATSAPP MESSAGE HANDLER ---
-bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text ? msg.text.trim() : '';
-    if (!text || text.startsWith('/')) return;
-
-    if (text.startsWith('.grstatus ')) {
-        const sock = activeSessions.get(chatId);
-        if (!sock) return bot.sendMessage(chatId, "❌ Use `/link` first.");
-        bot.sendMessage(chatId, "🚀 Preparing status...");
-        postStatusToGroups(sock, text.replace('.grstatus ', '').trim(), chatId);
-    }
-});
-
 // --- CONNECTION LOGIC ---
 async function startWhatsAppSession(chatId) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
         
-        // Fetch latest version to prevent 405 errors
         const { version } = await fetchLatestWaWebVersion({});
 
         const sock = makeWASocket({
@@ -103,7 +84,7 @@ async function startWhatsAppSession(chatId) {
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
             printQRInTerminal: false,
             logger: logger,
-            browser: Browsers.macOS('Desktop'), // Required to bypass WhatsApp blocks
+            browser: Browsers.macOS('Desktop'),
             markOnlineOnConnect: false,
             syncFullHistory: false
         });
@@ -132,7 +113,7 @@ async function startWhatsAppSession(chatId) {
             if (connection === 'open') {
                 clearTimeout(qrTimeout);
                 activeSessions.set(chatId, sock);
-                bot.sendMessage(chatId, "✅ WhatsApp linked! You can now use `.grstatus` inside WhatsApp.");
+                bot.sendMessage(chatId, "✅ WhatsApp linked! You can now type `.grstatus <text>` inside WhatsApp.");
             }
 
             if (connection === 'close') {
@@ -148,6 +129,26 @@ async function startWhatsAppSession(chatId) {
                 }
             }
         });
+
+        // 🚨 THIS IS THE NEW PART: Listens for messages INSIDE WhatsApp
+        sock.ev.on('messages.upsert', async (m) => {
+            const msg = m.messages[0];
+            if (!msg.message || !msg.key.fromMe) return; // Only listen to messages sent by YOU
+
+            const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+            
+            if (text && text.startsWith('.grstatus ')) {
+                const statusMessage = text.replace('.grstatus ', '').trim();
+                const myJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
+                
+                console.log("🚀 Command received inside WhatsApp!");
+                await sock.sendMessage(myJid, { text: "⏳ Preparing status..." });
+                
+                // Pass the WhatsApp socket to the posting function
+                postStatusToGroups(sock, statusMessage, myJid);
+            }
+        });
+
     } catch (err) {
         console.error("Session error:", err);
         bot.sendMessage(chatId, "❌ Internal error. Check Render logs.");
@@ -155,7 +156,7 @@ async function startWhatsAppSession(chatId) {
 }
 
 // --- POSTING LOGIC ---
-async function postStatusToGroups(sock, statusMessage, chatId) {
+async function postStatusToGroups(sock, statusMessage, targetJid) {
     try {
         const groups = await sock.groupFetchAllParticipating();
         let validGroups = Object.values(groups).filter(g => !g.announce);
@@ -231,6 +232,8 @@ async function postStatusToGroups(sock, statusMessage, chatId) {
             };
         }
 
+        await sock.sendMessage(targetJid, { text: `📊 Found ${validGroups.length} groups. Posting NOW...` });
+
         let count = 1;
         let successCount = 0;
         let batchCount = 0;
@@ -253,9 +256,9 @@ async function postStatusToGroups(sock, statusMessage, chatId) {
             }
         }
         
-        bot.sendMessage(chatId, `🎉 Finished! Successfully posted to ${successCount}/${validGroups.length} groups.`);
+        await sock.sendMessage(targetJid, { text: `🎉 Finished! Successfully posted to ${successCount}/${validGroups.length} groups.` });
     } catch (error) {
-        bot.sendMessage(chatId, `❌ Error during posting: ${error.message}`);
+        console.error("Posting error:", error);
     }
 }
 

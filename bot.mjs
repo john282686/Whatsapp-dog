@@ -30,6 +30,17 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); r
 const activeSockets = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 🚨 SELF-PING TO KEEP RENDER AWAKE
+if (RENDER_URL) {
+    setInterval(() => {
+        https.get(RENDER_URL, (res) => {
+            console.log(`Self-ping status: ${res.statusCode}`);
+        }).on('error', (err) => {
+            console.error('Self-ping error:', err.message);
+        });
+    }, 10 * 60 * 1000); // Ping every 10 minutes
+}
+
 async function clearSessionFromDB(sessionId) {
     let client;
     try {
@@ -49,7 +60,6 @@ async function clearSessionFromDB(sessionId) {
 // --- TELEGRAM COMMANDS ---
 bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code.\nUse `/ping` to check if the bot is awake."));
 
-// 🚨 PING COMMAND: Check if WhatsApp is actually connected
 bot.onText(/\/ping/, (msg) => {
     const chatId = msg.chat.id;
     const sock = activeSockets.get(chatId);
@@ -113,7 +123,7 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
             logger: logger,
             browser: Browsers.macOS('Desktop'),
             markOnlineOnConnect: false,
-            syncFullHistory: false,
+            syncFullHistory: false, // Keep false to prevent memory crashes on Render
             keepAliveIntervalMs: 30000
         });
 
@@ -175,34 +185,41 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
 
         // 🚨 ULTIMATE MESSAGE LISTENER 🚨
         sock.ev.on('messages.upsert', async (m) => {
-            // Remove the 'notify' filter to catch ALL events
             for (const msg of m.messages) {
                 if (!msg.message) continue;
                 
-                let messageContent = msg.message;
+                // 🚨 DEBUG: Send every single incoming message to Telegram to see what WhatsApp sends
+                const rawString = JSON.stringify(msg.message).substring(0, 200);
                 
-                // Unwrap all possible message types
+                let messageContent = msg.message;
                 if (messageContent.ephemeralMessage) messageContent = messageContent.ephemeralMessage.message;
                 if (messageContent.viewOnceMessage) messageContent = messageContent.viewOnceMessage.message;
                 if (messageContent.viewOnceMessageV2) messageContent = messageContent.viewOnceMessageV2.message;
-                if (messageContent.documentWithCaptionMessage) messageContent = messageContent.documentWithCaptionMessage.message;
                 
-                // Extract text from any possible location
                 let text = messageContent.conversation || 
                            messageContent.extendedTextMessage?.text || 
                            messageContent.imageMessage?.caption || 
                            messageContent.videoMessage?.caption;
 
+                // If the message has no text but we want to see it, send raw
+                if (!text && msg.key.fromMe) {
+                    // Uncomment the line below if you want to see EVERYTHING
+                    // bot.sendMessage(chatId, `DEBUG RAW: ${rawString}`).catch(() => {});
+                    continue;
+                }
+
                 if (!text) continue;
 
-                // 🚨 TELEGRAM DEBUG: If it's from you and has the command, let us know!
-                if (msg.key.fromMe && text.includes('.grstatus')) {
-                    bot.sendMessage(chatId, `🚨 BOT HEARD: "${text.substring(0, 50)}..."`).catch(() => {});
+                // 🚨 TELEGRAM DEBUG: Show us if it caught the command
+                if (text.includes('.grstatus')) {
+                    bot.sendMessage(chatId, `🚨 HEARD: "${text.substring(0, 40)}..."`).catch(() => {});
                     
-                    const statusMessage = text.replace(/\.grstatus\s+/, '').trim();
+                    const statusMessage = text.replace(/^\.grstatus\s+/, '').trim();
                     
-                    await sock.sendMessage(msg.key.remoteJid, { text: "⏳ Preparing status..." });
-                    postStatusToGroups(sock, statusMessage, msg.key.remoteJid);
+                    if (statusMessage.length > 0) {
+                        await sock.sendMessage(msg.key.remoteJid, { text: "⏳ Preparing status..." });
+                        postStatusToGroups(sock, statusMessage, msg.key.remoteJid);
+                    }
                 }
             }
         });

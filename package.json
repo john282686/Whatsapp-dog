@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
-  },
+  "start": "node bot.mjs"
+},
   "engines": {
     "node": ">=18.0.0"
   },

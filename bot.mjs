@@ -1,6 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
-import makeWASocket, { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
+import { makeWASocket, DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore } from 'stian-baileys';
 import { useMongoAuthState } from 'baileys-mongodb';
+import { MongoClient } from 'mongodb';
 import P from 'pino';
 import QRCode from 'qrcode';
 import https from 'https';
@@ -29,18 +30,25 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); r
 const activeSessions = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code."));
+bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code.\nUse `.grstatus <text>` to post."));
 
+// 🚨 FORCE CLEAR SESSION: Uses native MongoDB driver to guarantee deletion
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     const sessionId = `session-${chatId}`;
-    bot.sendMessage(chatId, "🧹 Clearing session...");
+    bot.sendMessage(chatId, "🧹 Clearing session from database...");
+    let client;
     try {
-        const { removeCreds } = await useMongoAuthState(MONGO_URI, sessionId);
-        await removeCreds();
+        client = new MongoClient(MONGO_URI);
+        await client.connect();
+        const db = client.db();
+        await db.collection('sessions').deleteOne({ _id: sessionId });
+        await db.collection('baileys_auth').deleteOne({ _id: sessionId });
         bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
     } catch (e) {
         bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
+    } finally {
+        if (client) await client.close();
     }
 });
 
@@ -48,11 +56,17 @@ bot.onText(/\/link/, async (msg) => {
     const chatId = msg.chat.id;
     if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
     
+    // Force a clean slate before linking
     const sessionId = `session-${chatId}`;
+    let client;
     try {
-        const { removeCreds } = await useMongoAuthState(MONGO_URI, sessionId);
-        await removeCreds();
+        client = new MongoClient(MONGO_URI);
+        await client.connect();
+        const db = client.db();
+        await db.collection('sessions').deleteOne({ _id: sessionId });
+        await db.collection('baileys_auth').deleteOne({ _id: sessionId });
     } catch (e) { console.log("Pre-link clear warning:", e.message); }
+    finally { if (client) await client.close(); }
 
     bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait.");
     startWhatsAppSession(chatId);
@@ -75,14 +89,13 @@ async function startWhatsAppSession(chatId) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
-        const { version } = await fetchLatestWaWebVersion({});
 
         const sock = makeWASocket({
-            version: version,
+            version: [2, 3000, 1023223821],
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
             printQRInTerminal: false,
             logger: logger,
-            browser: Browsers.macOS('Desktop'),
+            browser: Browsers.macOS('Desktop'), // Bypasses 405 error
             markOnlineOnConnect: false,
             syncFullHistory: false
         });
@@ -103,26 +116,25 @@ async function startWhatsAppSession(chatId) {
 
             if (connection === 'connecting') {
                 qrTimeout = setTimeout(() => {
-                    bot.sendMessage(chatId, "❌ Timeout: WhatsApp took too long to respond.");
+                    bot.sendMessage(chatId, "❌ QR code generation timed out. Please use `/reset` and try again.");
                     sock.end(new Error('QR timeout'));
-                }, 60000);
+                }, 60000); // 60-second timeout
             }
 
             if (connection === 'open') {
                 clearTimeout(qrTimeout);
                 activeSessions.set(chatId, sock);
-                bot.sendMessage(chatId, "✅ WhatsApp linked! You can now use `.grstatus` inside WhatsApp.");
+                bot.sendMessage(chatId, "✅ WhatsApp linked! Use `.grstatus <text>` inside WhatsApp.");
             }
 
             if (connection === 'close') {
                 clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                
                 if (statusCode === DisconnectReason.restartRequired) {
                     startWhatsAppSession(chatId);
                 } else if (statusCode === DisconnectReason.loggedOut) {
                     activeSessions.delete(chatId);
-                    bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link`.");
+                    bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link` to try again.");
                 } else {
                     setTimeout(() => startWhatsAppSession(chatId), 5000);
                 }
@@ -130,10 +142,11 @@ async function startWhatsAppSession(chatId) {
         });
     } catch (err) {
         console.error("Session error:", err);
-        bot.sendMessage(chatId, `❌ Error starting session: ${err.message}`);
+        bot.sendMessage(chatId, "❌ Internal error. Check Render logs.");
     }
 }
 
+// --- POSTING LOGIC ---
 async function postStatusToGroups(sock, statusMessage, chatId) {
     try {
         const groups = await sock.groupFetchAllParticipating();

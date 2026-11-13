@@ -1,10 +1,11 @@
-const TelegramBot = require('node-telegram-bot-api');
-const { useMongoAuthState } = require('baileys-mongodb');
-const P = require('pino');
-const QRCode = require('qrcode');
-const https = require('https');
-const { getLinkPreview } = require('link-preview-js');
-const express = require('express');
+import TelegramBot from 'node-telegram-bot-api';
+import makeWASocket, { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
+import { useMongoAuthState } from 'baileys-mongodb';
+import P from 'pino';
+import QRCode from 'qrcode';
+import https from 'https';
+import { getLinkPreview } from 'link-preview-js';
+import express from 'express';
 
 process.on('uncaughtException', (err) => console.error('🚨 Uncaught Exception:', err));
 process.on('unhandledRejection', (reason) => console.error('🚨 Unhandled Rejection:', reason));
@@ -53,7 +54,7 @@ bot.onText(/\/link/, async (msg) => {
         await removeCreds();
     } catch (e) { console.log("Pre-link clear warning:", e.message); }
 
-    bot.sendMessage(chatId, "⏳ Connecting to WhatsApp... (I will tell you the status)");
+    bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait.");
     startWhatsAppSession(chatId);
 });
 
@@ -74,12 +75,6 @@ async function startWhatsAppSession(chatId) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
-
-        // 🚨 DYNAMIC IMPORT: Fixes the ERR_REQUIRE_ASYNC_MODULE crash
-        const baileys = await import('@whiskeysockets/baileys');
-        const makeWASocket = baileys.default || baileys.makeWASocket;
-        const { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore, fetchLatestWaWebVersion } = baileys;
-
         const { version } = await fetchLatestWaWebVersion({});
 
         const sock = makeWASocket({
@@ -97,10 +92,6 @@ async function startWhatsAppSession(chatId) {
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
-
-            if (connection) {
-                bot.sendMessage(chatId, `⚙️ Status: ${connection}`);
-            }
 
             if (qr) {
                 clearTimeout(qrTimeout);
@@ -126,10 +117,7 @@ async function startWhatsAppSession(chatId) {
             if (connection === 'close') {
                 clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const errorMessage = lastDisconnect?.error?.message || "Unknown error";
                 
-                bot.sendMessage(chatId, `❌ Disconnected. Code: ${statusCode} (${errorMessage})`);
-
                 if (statusCode === DisconnectReason.restartRequired) {
                     startWhatsAppSession(chatId);
                 } else if (statusCode === DisconnectReason.loggedOut) {

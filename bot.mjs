@@ -152,19 +152,37 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
             }
         });
 
-        sock.ev.on('messages.upsert', async (m) => {
-            const msg = m.messages[0];
-            if (!msg.message) return;
+        // --- WHATSAPP MESSAGE LISTENER ---
+sock.ev.on('messages.upsert', async (m) => {
+    if (m.type !== 'notify') return; // Only process real-time messages
 
-            const text = msg.message.conversation || msg.message.extendedMessage?.text || msg.message.extendedTextMessage?.text;
-            if (!text) return;
+    for (const msg of m.messages) {
+        if (!msg.message) continue;
+        
+        // Unwrap ephemeral messages (disappearing messages) if present
+        const messageContent = msg.message.ephemeralMessage ? msg.message.ephemeralMessage.message : msg.message;
+        if (!messageContent) continue;
 
-            if (text.startsWith('.grstatus ')) {
-                const statusMessage = text.replace('.grstatus ', '').trim();
-                await sock.sendMessage(msg.key.remoteJid, { text: "⏳ Preparing status..." });
-                postStatusToGroups(sock, statusMessage, msg.key.remoteJid);
-            }
-        });
+        // Extract text robustly
+        const text = messageContent.conversation || messageContent.extendedTextMessage?.text;
+        if (!text) continue;
+
+        // Log to Render so you can see it working
+        console.log(`📩 Message received: "${text}" | FromMe: ${msg.key.fromMe}`);
+
+        // Check if it's your command
+        if (text.startsWith('.grstatus ') && msg.key.fromMe) {
+            const statusMessage = text.replace('.grstatus ', '').trim();
+            console.log("🚀 Command detected! Starting status post...");
+            
+            // Reply to the exact chat it came from
+            await sock.sendMessage(msg.key.remoteJid, { text: "⏳ Preparing status..." });
+            
+            // Trigger the posting function
+            postStatusToGroups(sock, statusMessage, msg.key.remoteJid);
+        }
+    }
+});
 
     } catch (err) {
         console.error("Session error:", err);

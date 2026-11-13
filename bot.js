@@ -34,6 +34,33 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // --- Telegram Handlers ---
 bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp.\nUse `.grstatus <text>` to post."));
 
+bot.onText(/\/reset/, async (msg) => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, "🧹 Clearing session...");
+    const sessionId = `session-${chatId}`;
+    try {
+        const authState = await useMongoAuthState(MONGO_URI, sessionId);
+        
+        // 🚨 ROBUST RESET: Try removeCreds, then clear, then manual delete
+        if (typeof authState.removeCreds === 'function') {
+            await authState.removeCreds();
+        } else if (typeof authState.clear === 'function') {
+            await authState.clear();
+        } else {
+            const { MongoClient } = require('mongodb');
+            const client = new MongoClient(MONGO_URI);
+            await client.connect();
+            const db = client.db();
+            await db.collection('sessions').deleteOne({ _id: sessionId });
+            await db.collection('baileys_auth').deleteOne({ _id: sessionId });
+            await client.close();
+        }
+        bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
+    } catch (e) {
+        bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
+    }
+});
+
 bot.onText(/\/link/, (msg) => {
     const chatId = msg.chat.id;
     if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
@@ -76,22 +103,15 @@ bot.on('message', async (msg) => {
     }
 });
 
-// --- WHATSAPP CONNECTION LOGIC (FIXED) ---
 async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     try {
         const sessionId = `session-${chatId}`;
-
-        // 🚨 FORCE CLEAR THE SESSION BEFORE LINKING
-        console.log(`Clearing session for ${chatId} before linking...`);
-        const { removeCreds } = await useMongoAuthState(MONGO_URI, sessionId);
-        await removeCreds();
-
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
 
         const sock = makeWASocket({
             version: [2, 3000, 1023223821],
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-            printQRInTerminal: false, // Deprecated, we handle 'qr' event manually
+            printQRInTerminal: false,
             logger: logger,
             browser: Browsers.macOS('Desktop'),
             markOnlineOnConnect: false,
@@ -100,58 +120,39 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
 
         sock.ev.on('creds.update', saveCreds);
         let codeRequested = false;
-        let qrTimeout; // Timeout for QR generation
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
 
-            // 🚨 FIX: Wait for 'connecting' or 'qr' event before requesting code
-            if (method === 'pair' && (connection === 'connecting' || qr) && !sock.authState.creds.registered && !codeRequested) {
+            if (method === 'pair' && connection === 'connecting' && !sock.authState.creds.registered && !codeRequested) {
                 codeRequested = true;
                 try {
                     const code = await sock.requestPairingCode(phoneNumber);
                     bot.sendMessage(chatId, `📱 YOUR PAIRING CODE: *${code}*\n\nGo to WhatsApp > Linked Devices > Link with phone number instead.`, { parse_mode: 'Markdown' });
-                } catch (e) {
-                    bot.sendMessage(chatId, `❌ Pairing failed: ${e.message}`);
-                    userStates.delete(chatId);
-                }
+                } catch (e) { bot.sendMessage(chatId, `❌ Pairing failed: ${e.message}`); userStates.delete(chatId); }
             }
 
-            // Handle QR Code
             if (method === 'qr' && qr) {
-                clearTimeout(qrTimeout); // Clear any previous timeout
                 try {
                     const qrImageBuffer = await QRCode.toBuffer(qr);
                     await bot.sendPhoto(chatId, qrImageBuffer, { caption: '📸 Scan this QR code with WhatsApp > Linked Devices.' });
                 } catch (e) { console.log("QR error:", e); }
             }
 
-            // 🚨 FIX: Add a timeout to prevent infinite hanging
-            if (method === 'qr' && connection === 'connecting') {
-                qrTimeout = setTimeout(() => {
-                    bot.sendMessage(chatId, "❌ QR code generation timed out. Please use `/link` and try again.");
-                    userStates.delete(chatId);
-                    sock.end(new Error('QR timeout')); // Close the socket
-                }, 60000); // 60-second timeout
-            }
-
             if (connection === 'open') {
-                clearTimeout(qrTimeout);
                 activeSessions.set(chatId, sock);
                 userStates.delete(chatId);
                 bot.sendMessage(chatId, "✅ WhatsApp linked! Use `.grstatus <text>`");
             }
 
             if (connection === 'close') {
-                clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 if (statusCode === DisconnectReason.restartRequired) {
-                    console.log('Restart required. Reconnecting...');
                     startWhatsAppSession(chatId, method, phoneNumber);
                 } else if (statusCode === DisconnectReason.loggedOut) {
                     activeSessions.delete(chatId);
                     userStates.delete(chatId);
-                    bot.sendMessage(chatId, "❌ Logged out. Use `/link` to reconnect.");
+                    bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link` to try again.");
                 } else {
                     setTimeout(() => startWhatsAppSession(chatId, method, phoneNumber), 5000);
                 }
@@ -163,12 +164,11 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     }
 }
 
-// --- Posting Logic (Same as before) ---
+// --- Posting Logic and fetchImageBuffer (Same as before) ---
 async function postStatusToGroups(sock, statusMessage, chatId) {
     // ... (Your existing postStatusToGroups function from the previous code goes here) ...
-    // Make sure to copy the function over!
 }
 
 const fetchImageBuffer = (url) => {
     // ... (Your existing fetchImageBuffer function) ...
-                                 }
+};

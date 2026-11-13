@@ -2,7 +2,6 @@ const TelegramBot = require('node-telegram-bot-api');
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore, fetchLatestWaWebVersion } = require('@whiskeysockets/baileys');
 const { useMongoAuthState } = require('baileys-mongodb');
-const { MongoClient } = require('mongodb');
 const P = require('pino');
 const QRCode = require('qrcode');
 const https = require('https');
@@ -29,67 +28,43 @@ if (RENDER_URL) {
 app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
 
 const activeSessions = new Map();
-const userStates = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- TELEGRAM (Used ONLY for linking) ---
-bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp.\nOnce connected, use `.grstatus <text>` inside your WhatsApp 'Message Yourself' chat."));
+bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp.\nUse `.grstatus <text>` to post."));
 
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     bot.sendMessage(chatId, "🧹 Clearing session...");
-    let client;
     try {
-        client = new MongoClient(MONGO_URI);
-        await client.connect();
-        const db = client.db();
-        await db.collection('sessions').deleteOne({ _id: `session-${chatId}` });
-        await db.collection('baileys_auth').deleteOne({ _id: `session-${chatId}` });
+        const { removeCreds } = await useMongoAuthState(MONGO_URI, `session-${chatId}`);
+        await removeCreds();
         bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
     } catch (e) {
         bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
-    } finally {
-        if (client) await client.close();
     }
 });
 
 bot.onText(/\/link/, (msg) => {
     const chatId = msg.chat.id;
     if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
-    userStates.set(chatId, { action: 'AWAITING_METHOD' });
-    bot.sendMessage(chatId, "Link via:\n\n1️⃣ Reply `1` for QR Code\n2️⃣ Reply `2` for Pairing Code", { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait a moment.");
+    startWhatsAppSession(chatId);
 });
 
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text ? msg.text.trim() : '';
     if (!text || text.startsWith('/')) return;
-    const state = userStates.get(chatId);
 
-    if (state && state.action === 'AWAITING_METHOD') {
-        if (text === '1') {
-            userStates.set(chatId, { action: 'CONNECTING_QR' });
-            bot.sendMessage(chatId, "⏳ Generating QR Code...");
-            startWhatsAppSession(chatId, 'qr');
-        } else if (text === '2') {
-            userStates.set(chatId, { action: 'AWAITING_PHONE' });
-            bot.sendMessage(chatId, "📱 Send your WhatsApp number with country code (e.g., `233201065918`).");
-        }
-        return;
-    }
-
-    if (state && state.action === 'AWAITING_PHONE') {
-        const cleanNumber = text.replace(/\D/g, '');
-        if (cleanNumber.length < 10) return bot.sendMessage(chatId, "❌ Invalid number.");
-        userStates.set(chatId, { action: 'CONNECTING_PAIR' });
-        bot.sendMessage(chatId, "⏳ Requesting Pairing Code...");
-        startWhatsAppSession(chatId, 'pair', cleanNumber);
-        return;
+    if (text.startsWith('.grstatus ')) {
+        const sock = activeSessions.get(chatId);
+        if (!sock) return bot.sendMessage(chatId, "❌ Use `/link` first.");
+        bot.sendMessage(chatId, "🚀 Preparing status...");
+        postStatusToGroups(sock, text.replace('.grstatus ', '').trim(), chatId);
     }
 });
 
-// --- WHATSAPP CONNECTION LOGIC ---
-async function startWhatsAppSession(chatId, method, phoneNumber = null) {
+async function startWhatsAppSession(chatId) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
@@ -100,85 +75,47 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
             printQRInTerminal: false,
             logger: logger,
-            browser: Browsers.macOS('Desktop'),
+            browser: Browsers.macOS('Desktop'), // 🚨 Fixes 405 error
             markOnlineOnConnect: false,
             syncFullHistory: false
         });
 
         sock.ev.on('creds.update', saveCreds);
-        let codeRequested = false;
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
 
-            if (method === 'pair' && connection === 'connecting' && !sock.authState.creds.registered && !codeRequested) {
-                codeRequested = true;
-                try {
-                    const code = await sock.requestPairingCode(phoneNumber);
-                    bot.sendMessage(chatId, `📱 YOUR PAIRING CODE: *${code}*\n\nGo to WhatsApp > Linked Devices > Link with phone number instead.`, { parse_mode: 'Markdown' });
-                } catch (e) { bot.sendMessage(chatId, `❌ Pairing failed: ${e.message}`); userStates.delete(chatId); }
-            }
-
-            if (method === 'qr' && qr) {
+            if (qr) {
                 try {
                     const qrImageBuffer = await QRCode.toBuffer(qr);
-                    await bot.sendPhoto(chatId, qrImageBuffer, { caption: '📸 Scan this QR code with WhatsApp.' });
+                    await bot.sendPhoto(chatId, qrImageBuffer, { caption: '📸 Scan this QR code with WhatsApp > Linked Devices.' });
                 } catch (e) { console.log("QR error:", e); }
             }
 
             if (connection === 'open') {
                 activeSessions.set(chatId, sock);
-                userStates.delete(chatId);
-                bot.sendMessage(chatId, "✅ WhatsApp linked successfully!\n\nYou can now close Telegram and use `.grstatus <text>` inside your WhatsApp 'Message Yourself' chat.");
+                bot.sendMessage(chatId, "✅ WhatsApp linked! Use `.grstatus <text>`");
             }
 
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 if (statusCode === DisconnectReason.loggedOut) {
                     activeSessions.delete(chatId);
-                    userStates.delete(chatId);
+                    bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link` to try again.");
                 } else if (statusCode === DisconnectReason.restartRequired) {
-                    startWhatsAppSession(chatId, method, phoneNumber);
+                    startWhatsAppSession(chatId);
                 } else {
-                    setTimeout(() => startWhatsAppSession(chatId, method, phoneNumber), 5000);
+                    setTimeout(() => startWhatsAppSession(chatId), 5000);
                 }
             }
         });
-
-        // 🚨 LISTEN FOR COMMANDS DIRECTLY INSIDE WHATSAPP 🚨
-        sock.ev.on('messages.upsert', async (m) => {
-            const msg = m.messages[0];
-            if (!msg.message || !msg.key.fromMe) return;
-
-            const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
-            
-            if (text && text.startsWith('.grstatus ')) {
-                const statusMessage = text.replace('.grstatus ', '').trim();
-                const myJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
-
-                console.log(`\n🚀 Command detected from WhatsApp!`);
-                await sock.sendMessage(myJid, { text: "⏳ Preparing status..." });
-
-                postStatusToGroups(sock, statusMessage, myJid, true);
-            }
-        });
-
     } catch (err) {
         console.error("Session error:", err);
         bot.sendMessage(chatId, "❌ Internal error. Check Render logs.");
     }
 }
 
-// --- POSTING LOGIC (Sends updates to WhatsApp now) ---
-async function postStatusToGroups(sock, statusMessage, chatId, isWhatsApp) {
-    const sendMsg = async (text) => {
-        if (isWhatsApp) {
-            await sock.sendMessage(chatId, { text });
-        } else {
-            await bot.sendMessage(chatId, text);
-        }
-    };
-
+async function postStatusToGroups(sock, statusMessage, chatId) {
     try {
         const groups = await sock.groupFetchAllParticipating();
         let validGroups = Object.values(groups).filter(g => !g.announce);
@@ -254,8 +191,6 @@ async function postStatusToGroups(sock, statusMessage, chatId, isWhatsApp) {
             };
         }
 
-        await sendMsg(`📊 Found ${validGroups.length} groups. Posting NOW...`);
-
         let count = 1;
         let successCount = 0;
         let batchCount = 0;
@@ -278,9 +213,9 @@ async function postStatusToGroups(sock, statusMessage, chatId, isWhatsApp) {
             }
         }
         
-        await sendMsg(`🎉 Finished! Successfully posted to ${successCount}/${validGroups.length} groups.`);
+        bot.sendMessage(chatId, `🎉 Finished! Successfully posted to ${successCount}/${validGroups.length} groups.`);
     } catch (error) {
-        await sendMsg(`❌ Error during posting: ${error.message}`);
+        bot.sendMessage(chatId, `❌ Error during posting: ${error.message}`);
     }
 }
 

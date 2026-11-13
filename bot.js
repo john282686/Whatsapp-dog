@@ -111,7 +111,7 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
         const sock = makeWASocket({
             version: [2, 3000, 1023223821],
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-            printQRInTerminal: false,
+            printQRInTerminal: false, // Deprecated, we handle 'qr' event manually
             logger: logger,
             browser: Browsers.macOS('Desktop'),
             markOnlineOnConnect: false,
@@ -120,33 +120,52 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
 
         sock.ev.on('creds.update', saveCreds);
         let codeRequested = false;
+        let qrTimeout; // Timeout for QR generation
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
 
-            if (method === 'pair' && connection === 'connecting' && !sock.authState.creds.registered && !codeRequested) {
+            // 🚨 FIX: Wait for 'connecting' or 'qr' event before requesting code
+            if (method === 'pair' && (connection === 'connecting' || qr) && !sock.authState.creds.registered && !codeRequested) {
                 codeRequested = true;
                 try {
                     const code = await sock.requestPairingCode(phoneNumber);
                     bot.sendMessage(chatId, `📱 YOUR PAIRING CODE: *${code}*\n\nGo to WhatsApp > Linked Devices > Link with phone number instead.`, { parse_mode: 'Markdown' });
-                } catch (e) { bot.sendMessage(chatId, `❌ Pairing failed: ${e.message}`); userStates.delete(chatId); }
+                } catch (e) {
+                    bot.sendMessage(chatId, `❌ Pairing failed: ${e.message}`);
+                    userStates.delete(chatId);
+                }
             }
 
+            // Handle QR Code
             if (method === 'qr' && qr) {
+                clearTimeout(qrTimeout); // Clear any previous timeout
                 try {
                     const qrImageBuffer = await QRCode.toBuffer(qr);
                     await bot.sendPhoto(chatId, qrImageBuffer, { caption: '📸 Scan this QR code with WhatsApp > Linked Devices.' });
                 } catch (e) { console.log("QR error:", e); }
             }
 
+            // 🚨 FIX: Add a timeout to prevent infinite hanging
+            if (method === 'qr' && connection === 'connecting') {
+                qrTimeout = setTimeout(() => {
+                    bot.sendMessage(chatId, "❌ QR code generation timed out. Please use `/link` and try again.");
+                    userStates.delete(chatId);
+                    sock.end(new Error('QR timeout')); // Close the socket
+                }, 60000); // 60-second timeout
+            }
+
             if (connection === 'open') {
+                clearTimeout(qrTimeout);
                 activeSessions.set(chatId, sock);
                 userStates.delete(chatId);
                 bot.sendMessage(chatId, "✅ WhatsApp linked! Use `.grstatus <text>`");
             }
 
             if (connection === 'close') {
+                clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                // 🚨 FIX: Handle restartRequired (515) by reconnecting immediately
                 if (statusCode === DisconnectReason.restartRequired) {
                     startWhatsAppSession(chatId, method, phoneNumber);
                 } else if (statusCode === DisconnectReason.loggedOut) {
@@ -164,11 +183,12 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     }
 }
 
-// --- Posting Logic and fetchImageBuffer (Same as before) ---
+// --- Posting Logic (Same as before) ---
 async function postStatusToGroups(sock, statusMessage, chatId) {
     // ... (Your existing postStatusToGroups function from the previous code goes here) ...
+    // Make sure to copy the function over!
 }
 
 const fetchImageBuffer = (url) => {
     // ... (Your existing fetchImageBuffer function) ...
-};
+}

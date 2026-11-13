@@ -2,7 +2,6 @@ const TelegramBot = require('node-telegram-bot-api');
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const { DisconnectReason, prepareWAMessageMedia, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const { useMongoAuthState } = require('baileys-mongodb');
-const { MongoClient } = require('mongodb');
 const P = require('pino');
 const QRCode = require('qrcode');
 const https = require('https');
@@ -34,28 +33,31 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // --- TELEGRAM COMMANDS ---
 bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code.\nUse `.grstatus <text>` to post."));
 
+// 🚨 ROBUST RESET: Uses the official removeCreds() function from baileys-mongodb
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     const sessionId = `session-${chatId}`;
     bot.sendMessage(chatId, "🧹 Clearing session...");
-    let client;
     try {
-        client = new MongoClient(MONGO_URI);
-        await client.connect();
-        const db = client.db();
-        await db.collection('sessions').deleteOne({ _id: sessionId });
-        await db.collection('baileys_auth').deleteOne({ _id: sessionId });
+        const { removeCreds } = await useMongoAuthState(MONGO_URI, sessionId);
+        await removeCreds();
         bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
     } catch (e) {
         bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
-    } finally {
-        if (client) await client.close();
     }
 });
 
-bot.onText(/\/link/, (msg) => {
+bot.onText(/\/link/, async (msg) => {
     const chatId = msg.chat.id;
     if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
+    
+    // 🚨 Force a wipe before linking to ensure no stale session blocks the QR
+    const sessionId = `session-${chatId}`;
+    try {
+        const { removeCreds } = await useMongoAuthState(MONGO_URI, sessionId);
+        await removeCreds();
+    } catch (e) { console.log("Pre-link clear warning:", e.message); }
+
     bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait a moment.");
     startWhatsAppSession(chatId);
 });
@@ -74,18 +76,18 @@ bot.on('message', async (msg) => {
     }
 });
 
-// --- WHATSAPP CONNECTION LOGIC ---
+// --- WHATSAPP CONNECTION LOGIC (QR ONLY) ---
 async function startWhatsAppSession(chatId) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
 
         const sock = makeWASocket({
-            version: [2, 3000, 1023223821],
+            version: [2, 3000, 1023223821], // Stable version, avoids fetchLatestWaWebVersion issues
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-            printQRInTerminal: false,
+            printQRInTerminal: false, // Deprecated, we handle 'qr' event manually
             logger: logger,
-            browser: Browsers.macOS('Desktop'),
+            browser: Browsers.ubuntu('Chrome'), // 🚨 CHANGED: Ubuntu/Chrome works reliably on Render
             markOnlineOnConnect: false,
             syncFullHistory: false
         });
@@ -95,6 +97,9 @@ async function startWhatsAppSession(chatId) {
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
+            
+            // 🚨 DEBUG LOG: See exactly what state the connection is in
+            if (connection) console.log(`Connection state: ${connection}`);
 
             if (qr) {
                 clearTimeout(qrTimeout);
@@ -108,7 +113,7 @@ async function startWhatsAppSession(chatId) {
                 qrTimeout = setTimeout(() => {
                     bot.sendMessage(chatId, "❌ QR code generation timed out. Please use `/reset` and try again.");
                     sock.end(new Error('QR timeout'));
-                }, 60000);
+                }, 60000); // 60-second timeout
             }
 
             if (connection === 'open') {
@@ -120,7 +125,10 @@ async function startWhatsAppSession(chatId) {
             if (connection === 'close') {
                 clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.log(`Connection closed. Status: ${statusCode}`);
+                
                 if (statusCode === DisconnectReason.restartRequired) {
+                    console.log('Restart required. Reconnecting...');
                     startWhatsAppSession(chatId);
                 } else if (statusCode === DisconnectReason.loggedOut) {
                     activeSessions.delete(chatId);

@@ -6,7 +6,6 @@ const { MongoClient } = require('mongodb');
 const P = require('pino');
 const QRCode = require('qrcode');
 const https = require('https');
-const { getLinkPreview } = require('link-preview-js');
 const express = require('express');
 
 process.on('uncaughtException', (err) => console.error('🚨 Uncaught Exception:', err));
@@ -28,13 +27,9 @@ if (RENDER_URL) {
 }
 app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
 
-const activeSessions = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- Telegram Handlers ---
-bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code.\nUse `.grstatus <text>` to post."));
-
-// 🚨 FORCE CLEAR SESSION: Wipes old data from MongoDB
+// 🚨 FORCE CLEAR SESSION: Wipes old data from MongoDB before linking
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     const sessionId = `session-${chatId}`;
@@ -54,24 +49,10 @@ bot.onText(/\/reset/, async (msg) => {
     }
 });
 
-bot.onText(/\/link/, (msg) => {
+bot.onText(/\/link/, async (msg) => {
     const chatId = msg.chat.id;
-    if (activeSessions.has(chatId)) return bot.sendMessage(chatId, "⚠️ Already linked.");
     bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait a moment.");
-    startWhatsAppSession(chatId);
-});
-
-bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text ? msg.text.trim() : '';
-    if (!text || text.startsWith('/')) return;
-
-    if (text.startsWith('.grstatus ')) {
-        const sock = activeSessions.get(chatId);
-        if (!sock) return bot.sendMessage(chatId, "❌ Use `/link` first.");
-        bot.sendMessage(chatId, "🚀 Preparing status...");
-        postStatusToGroups(sock, text.replace('.grstatus ', '').trim(), chatId);
-    }
+    await startWhatsAppSession(chatId);
 });
 
 // --- WHATSAPP CONNECTION LOGIC (QR ONLY) ---
@@ -81,7 +62,7 @@ async function startWhatsAppSession(chatId) {
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
 
         const sock = makeWASocket({
-            version: [2, 3000, 1023223821], // Stable version, avoids fetchLatestWaWebVersion issues
+            version: [2, 3000, 1023223821], // Stable hardcoded version, avoids fetchLatestWaWebVersion issues
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
             printQRInTerminal: false, // Deprecated, we handle 'qr' event manually
             logger: logger,
@@ -115,7 +96,6 @@ async function startWhatsAppSession(chatId) {
 
             if (connection === 'open') {
                 clearTimeout(qrTimeout);
-                activeSessions.set(chatId, sock);
                 bot.sendMessage(chatId, "✅ WhatsApp linked! Use `.grstatus <text>`");
             }
 
@@ -124,9 +104,9 @@ async function startWhatsAppSession(chatId) {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 // 🚨 FIX: Handle restartRequired (515) by reconnecting immediately
                 if (statusCode === DisconnectReason.restartRequired) {
-                    startWhatsAppSession(chatId);
+                    console.log('Restart required. Reconnecting...');
+                    await startWhatsAppSession(chatId);
                 } else if (statusCode === DisconnectReason.loggedOut) {
-                    activeSessions.delete(chatId);
                     bot.sendMessage(chatId, "❌ Logged out. Use `/reset` then `/link` to try again.");
                 } else {
                     setTimeout(() => startWhatsAppSession(chatId), 5000);
@@ -137,13 +117,4 @@ async function startWhatsAppSession(chatId) {
         console.error("Session error:", err);
         bot.sendMessage(chatId, "❌ Internal error. Check Render logs.");
     }
-}
-
-// --- Posting Logic and fetchImageBuffer (Same as before) ---
-async function postStatusToGroups(sock, statusMessage, chatId) {
-    // ... (Your existing postStatusToGroups function goes here) ...
-}
-
-const fetchImageBuffer = (url) => {
-    // ... (Your existing fetchImageBuffer function goes here) ...
-};
+                    }

@@ -86,7 +86,9 @@ async function startWhatsAppSession(chatId) {
             logger: logger,
             browser: Browsers.macOS('Desktop'),
             markOnlineOnConnect: false,
-            syncFullHistory: false
+            syncFullHistory: false,
+            keepAliveIntervalMs: 60000, // 🚨 Keeps connection alive
+            connectTimeoutMs: 60000
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -114,6 +116,9 @@ async function startWhatsAppSession(chatId) {
                 clearTimeout(qrTimeout);
                 activeSessions.set(chatId, sock);
                 bot.sendMessage(chatId, "✅ WhatsApp linked! You can now type `.grstatus <text>` inside WhatsApp.");
+                
+                // 🚨 START BACKGROUND HUMAN SIMULATION
+                simulateHumanPresence(sock);
             }
 
             if (connection === 'close') {
@@ -130,28 +135,58 @@ async function startWhatsAppSession(chatId) {
             }
         });
 
-        // 🚨 THIS IS THE NEW PART: Listens for messages INSIDE WhatsApp
+        // 🚨 FIXED WHATSAPP MESSAGE LISTENER
         sock.ev.on('messages.upsert', async (m) => {
             const msg = m.messages[0];
-            if (!msg.message || !msg.key.fromMe) return; // Only listen to messages sent by YOU
+            if (!msg.message) return;
 
+            // Extract text safely
             const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
-            
-            if (text && text.startsWith('.grstatus ')) {
+            if (!text) return;
+
+            console.log(`📩 Received message: ${text}`);
+
+            if (text.startsWith('.grstatus ')) {
                 const statusMessage = text.replace('.grstatus ', '').trim();
-                const myJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
                 
-                console.log("🚀 Command received inside WhatsApp!");
-                await sock.sendMessage(myJid, { text: "⏳ Preparing status..." });
-                
-                // Pass the WhatsApp socket to the posting function
-                postStatusToGroups(sock, statusMessage, myJid);
+                // Send reply to the exact chat the command came from
+                await sock.sendMessage(msg.key.remoteJid, { text: "⏳ Preparing status..." });
+                postStatusToGroups(sock, statusMessage, msg.key.remoteJid);
             }
         });
 
     } catch (err) {
         console.error("Session error:", err);
         bot.sendMessage(chatId, "❌ Internal error. Check Render logs.");
+    }
+}
+
+// --- 🚨 BACKGROUND HUMAN SIMULATION ---
+async function simulateHumanPresence(sock) {
+    while (true) {
+        // Wait between 30 and 90 minutes
+        const waitMins = Math.floor(Math.random() * (90 - 30 + 1)) + 30;
+        await sleep(waitMins * 60 * 1000);
+        
+        try {
+            const myJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
+            
+            // Go online
+            await sock.sendPresenceUpdate('available');
+            await sleep(Math.floor(Math.random() * 3000) + 2000);
+            
+            // Show typing indicator to yourself
+            await sock.sendPresenceUpdate('composing', myJid);
+            await sleep(Math.floor(Math.random() * 4000) + 3000);
+            await sock.sendPresenceUpdate('paused', myJid);
+            
+            // Go offline
+            await sleep(5000);
+            await sock.sendPresenceUpdate('unavailable');
+            console.log('🤖 Simulated human presence cycle.');
+        } catch (error) {
+            // Ignore background errors
+        }
     }
 }
 
@@ -247,10 +282,13 @@ async function postStatusToGroups(sock, statusMessage, targetJid) {
             
             count++;
             if (count <= validGroups.length) {
-                const humanJitter = Math.floor(Math.random() * 400) + 100;
+                // 🚨 HUMAN JITTER: Random delay between 1.1s and 1.8s
+                const humanJitter = Math.floor(Math.random() * 700) + 100;
                 await sleep(1000 + humanJitter);
+                
+                // 🚨 MICRO-BREAK: Pause for 15 seconds after every 20 groups
                 if (batchCount === 20) {
-                    await sleep(10000);
+                    await sleep(15000);
                     batchCount = 0;
                 }
             }
@@ -259,6 +297,7 @@ async function postStatusToGroups(sock, statusMessage, targetJid) {
         await sock.sendMessage(targetJid, { text: `🎉 Finished! Successfully posted to ${successCount}/${validGroups.length} groups.` });
     } catch (error) {
         console.error("Posting error:", error);
+        await sock.sendMessage(targetJid, { text: `❌ Error during posting: ${error.message}` });
     }
 }
 

@@ -124,7 +124,6 @@ async function startWhatsAppSession(chatId) {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const errorMessage = lastDisconnect?.error?.message || "Unknown error";
                 
-                // 🚨 Send the exact error to Telegram so we can see it
                 bot.sendMessage(chatId, `❌ Disconnected. Code: ${statusCode} (${errorMessage})`);
 
                 if (statusCode === DisconnectReason.restartRequired) {

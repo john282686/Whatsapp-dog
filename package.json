@@ -2,6 +2,7 @@
   "name": "whatsapp-bot",
   "version": "1.0.0",
   "main": "bot.mjs",
+  "type": "module",
   "scripts": {
     "start": "node bot.mjs"
   },
@@ -9,7 +10,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "stian-baileys": "^0.2.2",
+    "@whiskeysockets/baileys": "^6.7.5",
     "baileys-mongodb": "^1.0.9",
     "express": "^4.18.0",
     "mongodb": "^6.0.0",

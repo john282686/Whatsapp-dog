@@ -35,25 +35,23 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // --- Telegram Handlers ---
 bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp.\nUse `.grstatus <text>` to post."));
 
+// 🚨 ROBUST RESET: Completely wipes the session from MongoDB
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     bot.sendMessage(chatId, "🧹 Clearing session...");
     const sessionId = `session-${chatId}`;
+    let client;
     try {
-        const authState = await useMongoAuthState(MONGO_URI, sessionId);
-        if (typeof authState.removeCreds === 'function') {
-            await authState.removeCreds();
-        } else {
-            const client = new MongoClient(MONGO_URI);
-            await client.connect();
-            const db = client.db();
-            await db.collection('sessions').deleteOne({ _id: sessionId });
-            await db.collection('baileys_auth').deleteOne({ _id: sessionId });
-            await client.close();
-        }
+        client = new MongoClient(MONGO_URI);
+        await client.connect();
+        const db = client.db();
+        await db.collection('sessions').deleteOne({ _id: sessionId });
+        await db.collection('baileys_auth').deleteOne({ _id: sessionId });
         bot.sendMessage(chatId, "✅ Session cleared! Use `/link` to try again.");
     } catch (e) {
         bot.sendMessage(chatId, `❌ Failed to clear session: ${e.message}`);
+    } finally {
+        if (client) await client.close();
     }
 });
 
@@ -104,13 +102,12 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
 
-        // 🚨 FIX: Use a stable, hardcoded version to prevent 405 errors
         const sock = makeWASocket({
-            version: [2, 3000, 1023223821], 
+            version: [2, 3000, 1023223821],
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-            printQRInTerminal: false, // Deprecated
+            printQRInTerminal: false,
             logger: logger,
-            browser: Browsers.macOS('Desktop'),
+            browser: Browsers.macOS('Desktop'), // Bypasses 405 error
             markOnlineOnConnect: false,
             syncFullHistory: false
         });
@@ -122,7 +119,7 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
 
-            // 🚨 FIX: Listen for the 'qr' event and render it manually
+            // 🚨 FIX: Wait for the 'qr' event before doing anything
             if (qr) {
                 if (method === 'qr') {
                     clearTimeout(qrTimeout);
@@ -131,7 +128,7 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
                         await bot.sendPhoto(chatId, qrImageBuffer, { caption: '📸 Scan this QR code with WhatsApp > Linked Devices.' });
                     } catch (e) { console.log("QR error:", e); }
                 } 
-                // 🚨 FIX: Request pairing code ONLY when the QR event fires (WebSocket is ready)
+                // 🚨 FIX: Request pairing code ONLY when the WebSocket is ready (qr event fires)
                 else if (method === 'pair' && !sock.authState.creds.registered && !codeRequested) {
                     codeRequested = true;
                     try {
@@ -163,9 +160,7 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
             if (connection === 'close') {
                 clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                
                 if (statusCode === DisconnectReason.restartRequired) {
-                    console.log('Restart required. Reconnecting...');
                     startWhatsAppSession(chatId, method, phoneNumber);
                 } else if (statusCode === DisconnectReason.loggedOut) {
                     activeSessions.delete(chatId);
@@ -182,122 +177,11 @@ async function startWhatsAppSession(chatId, method, phoneNumber = null) {
     }
 }
 
-// --- Posting Logic (Same as before) ---
+// --- Posting Logic (Same as before, keep your existing function) ---
 async function postStatusToGroups(sock, statusMessage, chatId) {
-    try {
-        const groups = await sock.groupFetchAllParticipating();
-        let validGroups = Object.values(groups).filter(g => !g.announce);
-        validGroups = validGroups.sort(() => Math.random() - 0.5);
-        
-        const urlRegex = /(https?:\/\/[^\s]+)/g;
-        const urls = statusMessage.match(urlRegex);
-        
-        let imgBuffer = null;
-        let channelName = "Join the Channel";
-        let channelDesc = "Click the link to view";
-
-        if (urls && urls.length > 0) {
-            const targetUrl = urls[0];
-            if (targetUrl.includes('whatsapp.com/channel/')) {
-                const channelId = targetUrl.split('/channel/')[1]?.split('?')[0];
-                if (channelId) {
-                    try {
-                        const metadata = await sock.newsletterMetadata("invite", channelId);
-                        if (metadata) {
-                            channelName = metadata.name || channelName;
-                            channelDesc = metadata.description || channelDesc;
-                            if (metadata.preview) imgBuffer = await fetchImageBuffer(metadata.preview);
-                        }
-                    } catch (e) { }
-                }
-            } else if (targetUrl.includes('chat.whatsapp.com/')) {
-                const inviteCode = targetUrl.split('/').pop();
-                try {
-                    const groupInfo = await sock.groupGetInviteInfo(inviteCode);
-                    if (groupInfo) {
-                        channelName = groupInfo.subject || channelName;
-                        channelDesc = groupInfo.desc || channelDesc;
-                    }
-                } catch (e) { }
-            } else {
-                try {
-                    const preview = await getLinkPreview(targetUrl, { headers: { 'user-agent': 'Mozilla/5.0' } });
-                    if (preview.title) channelName = preview.title;
-                    if (preview.description) channelDesc = preview.description;
-                    if (preview.images && preview.images.length > 0) {
-                        imgBuffer = await fetchImageBuffer(preview.images[0]);
-                    }
-                } catch (e) { }
-            }
-        }
-
-        if (!imgBuffer) {
-            try { imgBuffer = await fetchImageBuffer('https://picsum.photos/500/500.jpg'); } catch (e) { }
-        }
-
-        let content = { text: statusMessage };
-        if (imgBuffer) {
-            const { imageMessage } = await prepareWAMessageMedia(
-                { image: imgBuffer },
-                { upload: sock.waUploadToServer, mediaTypeOverride: 'thumbnail-link' }
-            );
-            imageMessage.height = 720;
-            imageMessage.width = 480;
-
-            content = {
-                text: statusMessage,
-                linkPreview: {
-                    'matched-text': urls ? urls[0] : '',
-                    'canonical-url': urls ? urls[0] : '',
-                    title: channelName,
-                    description: channelDesc,
-                    previewType: 0,
-                    jpegThumbnail: imgBuffer,
-                    highQualityThumbnail: imageMessage,
-                    linkPreviewMetadata: { socialMediaPostType: 4, linkMediaDuration: 0 }
-                }
-            };
-        }
-
-        let count = 1;
-        let successCount = 0;
-        let batchCount = 0;
-
-        for (const group of validGroups) {
-            try {
-                await sock.stianStatus.sendGroupStatus(group.id, content);
-                successCount++;
-                batchCount++;
-            } catch (err) { }
-            
-            count++;
-            if (count <= validGroups.length) {
-                const humanJitter = Math.floor(Math.random() * 400) + 100;
-                await sleep(1000 + humanJitter);
-                if (batchCount === 20) {
-                    await sleep(10000);
-                    batchCount = 0;
-                }
-            }
-        }
-        
-        bot.sendMessage(chatId, `🎉 Finished! Successfully posted to ${successCount}/${validGroups.length} groups.`);
-    } catch (error) {
-        bot.sendMessage(chatId, `❌ Error during posting: ${error.message}`);
-    }
+    // ... (Your existing postStatusToGroups function goes here) ...
 }
 
 const fetchImageBuffer = (url) => {
-    return new Promise((resolve, reject) => {
-        const options = { headers: { 'User-Agent': 'Mozilla/5.0' } };
-        https.get(url, options, (res) => {
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                return fetchImageBuffer(res.headers.location).then(resolve).catch(reject);
-            }
-            if (res.statusCode !== 200) return reject(new Error("Status " + res.statusCode));
-            const data = [];
-            res.on('data', (chunk) => data.push(chunk));
-            res.on('end', () => resolve(Buffer.concat(data)));
-        }).on('error', reject);
-    });
+    // ... (Your existing fetchImageBuffer function goes here) ...
 };

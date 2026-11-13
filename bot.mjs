@@ -27,7 +27,6 @@ if (RENDER_URL) {
 }
 app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
 
-// 🚨 GLOBAL SOCKET MANAGER
 const activeSockets = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -47,14 +46,25 @@ async function clearSessionFromDB(sessionId) {
     }
 }
 
-bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code."));
+// --- TELEGRAM COMMANDS ---
+bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code.\nUse `/ping` to check if the bot is awake."));
+
+// 🚨 PING COMMAND: Check if WhatsApp is actually connected
+bot.onText(/\/ping/, (msg) => {
+    const chatId = msg.chat.id;
+    const sock = activeSockets.get(chatId);
+    if (sock && sock.user) {
+        bot.sendMessage(chatId, `✅ WhatsApp is connected and listening.\nPhone: ${sock.user.id}`);
+    } else {
+        bot.sendMessage(chatId, `❌ WhatsApp is NOT connected. Use /link.`);
+    }
+});
 
 bot.onText(/\/reset/, async (msg) => {
     const chatId = msg.chat.id;
     const sessionId = `session-${chatId}`;
     bot.sendMessage(chatId, "🧹 Clearing session...");
     
-    // Kill old socket if exists
     if (activeSockets.has(chatId)) {
         const oldSock = activeSockets.get(chatId);
         oldSock.end(new Error('Reset requested'));
@@ -68,7 +78,6 @@ bot.onText(/\/reset/, async (msg) => {
 bot.onText(/\/link/, async (msg) => {
     const chatId = msg.chat.id;
     
-    // Kill old socket if exists
     if (activeSockets.has(chatId)) {
         const oldSock = activeSockets.get(chatId);
         oldSock.end(new Error('Relinking requested'));
@@ -87,7 +96,6 @@ bot.onText(/\/link/, async (msg) => {
 // --- CONNECTION LOGIC ---
 async function startWhatsAppSession(chatId, isInitialConnection = false) {
     try {
-        // 🚨 KILL EXISTING SOCKET TO PREVENT CONFLICT LOOPS
         if (activeSockets.has(chatId)) {
             const existing = activeSockets.get(chatId);
             existing.end(new Error('New session started'));
@@ -106,10 +114,9 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
             browser: Browsers.macOS('Desktop'),
             markOnlineOnConnect: false,
             syncFullHistory: false,
-            keepAliveIntervalMs: 30000 // Ping WhatsApp every 30s
+            keepAliveIntervalMs: 30000
         });
 
-        // Save to global map
         activeSockets.set(chatId, sock);
         sock.ev.on('creds.update', saveCreds);
         let qrTimeout;
@@ -137,11 +144,8 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
                 isInitialConnection = false; 
                 bot.sendMessage(chatId, "✅ WhatsApp linked! You can now type `.grstatus <text>` inside WhatsApp.");
                 
-                // 🚨 RENDER KEEP-ALIVE: Send a presence update every 10 seconds to prevent Render from sleeping
                 setInterval(async () => {
-                    try {
-                        await sock.sendPresenceUpdate('available');
-                    } catch (e) {}
+                    try { await sock.sendPresenceUpdate('available'); } catch (e) {}
                 }, 10000);
 
                 simulateHumanPresence(sock);
@@ -151,7 +155,6 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
                 clearTimeout(qrTimeout);
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 
-                // 🚨 PREVENT FLOODING: Only notify and reconnect if this is the active socket
                 if (activeSockets.get(chatId) !== sock) return; 
 
                 if (statusCode === DisconnectReason.loggedOut) {
@@ -160,12 +163,9 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
                     await clearSessionFromDB(sessionId);
                     bot.sendMessage(chatId, "✅ Old session deleted. Use `/link` to scan a new QR code.");
                 } else if (statusCode === DisconnectReason.restartRequired) {
-                    console.log("515 Restart Required. Reconnecting...");
                     startWhatsAppSession(chatId, false); 
                 } else {
-                    console.log(`Connection dropped (Code: ${statusCode}). Reconnecting...`);
                     await sleep(5000);
-                    // Only reconnect if we haven't been overwritten by a new socket
                     if (activeSockets.get(chatId) === sock) {
                         startWhatsAppSession(chatId, false);
                     }
@@ -173,29 +173,33 @@ async function startWhatsAppSession(chatId, isInitialConnection = false) {
             }
         });
 
-        // --- WHATSAPP MESSAGE LISTENER ---
+        // 🚨 ULTIMATE MESSAGE LISTENER 🚨
         sock.ev.on('messages.upsert', async (m) => {
-            if (m.type !== 'notify') return;
+            // Remove the 'notify' filter to catch ALL events
             for (const msg of m.messages) {
                 if (!msg.message) continue;
                 
                 let messageContent = msg.message;
+                
+                // Unwrap all possible message types
                 if (messageContent.ephemeralMessage) messageContent = messageContent.ephemeralMessage.message;
                 if (messageContent.viewOnceMessage) messageContent = messageContent.viewOnceMessage.message;
                 if (messageContent.viewOnceMessageV2) messageContent = messageContent.viewOnceMessageV2.message;
+                if (messageContent.documentWithCaptionMessage) messageContent = messageContent.documentWithCaptionMessage.message;
                 
-                if (!messageContent) continue;
+                // Extract text from any possible location
+                let text = messageContent.conversation || 
+                           messageContent.extendedTextMessage?.text || 
+                           messageContent.imageMessage?.caption || 
+                           messageContent.videoMessage?.caption;
 
-                const text = messageContent.conversation || messageContent.extendedTextMessage?.text;
                 if (!text) continue;
 
-                // 🚨 DEBUG: Log to Render and Telegram so we know it received the message
-                if (text.includes('.grstatus')) {
-                    bot.sendMessage(chatId, `🚨 CAUGHT CMD: "${text}"`).catch(() => {});
-                }
-
-                if (text.startsWith('.grstatus ') && msg.key.fromMe) {
-                    const statusMessage = text.replace('.grstatus ', '').trim();
+                // 🚨 TELEGRAM DEBUG: If it's from you and has the command, let us know!
+                if (msg.key.fromMe && text.includes('.grstatus')) {
+                    bot.sendMessage(chatId, `🚨 BOT HEARD: "${text.substring(0, 50)}..."`).catch(() => {});
+                    
+                    const statusMessage = text.replace(/\.grstatus\s+/, '').trim();
                     
                     await sock.sendMessage(msg.key.remoteJid, { text: "⏳ Preparing status..." });
                     postStatusToGroups(sock, statusMessage, msg.key.remoteJid);

@@ -30,7 +30,7 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => { bot.processUpdate(req.body); r
 const activeSessions = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// 🚨 HELPER: Force delete session directly from MongoDB
+// 🚨 HELPER: Force delete session from MongoDB
 async function clearSessionFromDB(sessionId) {
     let client;
     try {
@@ -47,7 +47,6 @@ async function clearSessionFromDB(sessionId) {
     }
 }
 
-// --- TELEGRAM COMMANDS ---
 bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, "👋 Use `/link` to connect your WhatsApp via QR Code."));
 
 bot.onText(/\/reset/, async (msg) => {
@@ -69,11 +68,11 @@ bot.onText(/\/link/, async (msg) => {
     await clearSessionFromDB(sessionId);
     
     bot.sendMessage(chatId, "⏳ Generating QR Code... Please wait.");
-    startWhatsAppSession(chatId);
+    startWhatsAppSession(chatId, true); // Pass true for initial connection
 });
 
 // --- CONNECTION LOGIC ---
-async function startWhatsAppSession(chatId) {
+async function startWhatsAppSession(chatId, isInitialConnection = false) {
     try {
         const sessionId = `session-${chatId}`;
         const { state, saveCreds } = await useMongoAuthState(MONGO_URI, sessionId);
@@ -114,6 +113,7 @@ async function startWhatsAppSession(chatId) {
 
             if (connection === 'open') {
                 clearTimeout(qrTimeout);
+                isInitialConnection = false; // 🚨 Disable initial connection flag after success
                 activeSessions.set(chatId, sock);
                 bot.sendMessage(chatId, "✅ WhatsApp linked! You can now type `.grstatus <text>` inside WhatsApp.");
                 simulateHumanPresence(sock);
@@ -127,13 +127,18 @@ async function startWhatsAppSession(chatId) {
                 bot.sendMessage(chatId, `❌ Disconnected. Code: ${statusCode} (${errorMessage})`);
 
                 if (statusCode === DisconnectReason.restartRequired) {
-                    startWhatsAppSession(chatId);
+                    // 🚨 Restart required happens immediately after a successful QR scan
+                    startWhatsAppSession(chatId, false); 
                 } else if (statusCode === DisconnectReason.loggedOut) {
-                    // 🚨 If it logs out, DO NOT reconnect automatically. Wait for user to /link again.
+                    // 🚨 401 means the session is dead. Wipe DB and wait for /link.
                     activeSessions.delete(chatId);
-                    bot.sendMessage(chatId, "❌ WhatsApp logged out the session. Use `/reset` then `/link` to try again.");
+                    await clearSessionFromDB(sessionId); // Force wipe
+                    bot.sendMessage(chatId, "❌ WhatsApp logged out the session. The old session has been deleted. Use `/link` to scan a new QR code.");
                 } else {
-                    setTimeout(() => startWhatsAppSession(chatId), 5000);
+                    // 🚨 If initial connection fails, DO NOT loop. Wait for user.
+                    if (!isInitialConnection) {
+                        bot.sendMessage(chatId, "❌ Connection lost. Use `/link` to reconnect.");
+                    }
                 }
             }
         });
